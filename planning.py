@@ -22,6 +22,9 @@ from models import (
     TripSearchResult,
 )
 from routing import route_request
+from pydantic import ValidationError
+from llm.openrouter import OpenRouterError
+from agents.travel_window import TravelWindowConstraintError
 
 
 def resolve_destinations(request: TripRequest) -> list[SuggestedDestination]:
@@ -76,7 +79,27 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
 
     
     for destination in destinations:
-        window_advice = evaluate_travel_window(request, destination)
+        try:
+            window_advice = evaluate_travel_window(request, destination)
+        except (OpenRouterError, ValidationError, TravelWindowConstraintError) as exc:
+            if isinstance(exc, OpenRouterError):
+                reason = ReasonCode.LLM_PROVIDER_ERROR
+            elif isinstance(exc, ValidationError):
+                reason = ReasonCode.LLM_OUTPUT_INVALID
+            else:
+                reason = ReasonCode.LLM_CONSTRAINT_VIOLATION
+
+            events.append(DecisionEvent(
+                event_type=EventType.TRAVEL_WINDOW_FAILED,
+                reason_code=reason,
+                details={"destination": destination.name},
+                comment="Valutazione del periodo non completata.",
+            ))
+            return PlanningError(
+                code=reason.value,
+                message="Non e stato possibile valutare il periodo di viaggio.",
+                trace=DecisionTrace(events=events),
+            )
 
         events.append(
             DecisionEvent(

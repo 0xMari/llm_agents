@@ -2,7 +2,7 @@
 
 from datetime import date
 
-from models import FlightOffer, HotelOffer
+from models import FlightOffer, Hotel
 
 
 FLIGHTS = [
@@ -45,18 +45,16 @@ FLIGHTS = [
 ]
 
 HOTELS = [
-    HotelOffer(
+    Hotel(
         destination = "Lisbon",
         name = "Central Stay",
         nightly_price_eur = 95,
         rating = 4.4,
-        nights = 5,
     ),
-    HotelOffer(
+    Hotel(
         destination = "Lisbon",
         name = "Simple Rooms",
         nightly_price_eur = 62,
         rating = 3.9,
-        nights = 5,
     ),
 ]

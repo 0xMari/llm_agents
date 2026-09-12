@@ -24,36 +24,45 @@ def call_openrouter_json(
     if not model:
         raise OpenRouterError("OPENROUTER_MODEL non configurato.")
 
-    response = requests.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost",
-            "X-OpenRouter-Title": "AI Travel Planner",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-            "provider": {
-                "require_parameters": True,
+    try:
+        response = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost",
+                "X-OpenRouter-Title": "AI Travel Planner",
             },
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "travel_window_advice",
-                    "strict": True,
-                    "schema": response_schema,
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.2,
+                "provider": {
+                    "require_parameters": True,
+                },
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "travel_window_advice",
+                        "strict": True,
+                        "schema": response_schema,
+                    },
                 },
             },
-        },
-        timeout=60,
-    )
+            timeout=60,
+        )
+    except requests.RequestException as exc:
+        raise OpenRouterError("Chiamata OpenRouter non riuscita.") from exc
 
     if response.status_code >= 400:
         raise OpenRouterError(response.text)
 
-    data = response.json()
+    try:
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise OpenRouterError("Struttura della risposta OpenRouter non valida.") from exc
 
-    return data["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise OpenRouterError("OpenRouter non ha restituito contenuto testuale.")
+
+    return content

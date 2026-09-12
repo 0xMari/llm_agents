@@ -66,6 +66,9 @@ Regole:
 - Se time_preference.mode è "month", usa time_context.resolved_year come anno obbligatorio per selected_periods.
 - Non inventare anni diversi da quelli forniti nel time_context.
 - Rispetta min_days e max_days quando presenti.
+- min_days e max_days indicano giorni inclusivi: conta sia il giorno di partenza sia quello di ritorno.
+- Calcola la durata come (end - start).days + 1.
+- Esempio: dal 15 al 20 settembre sono 6 giorni.
 - Usa score alto per periodi molto adatti, basso per periodi problematici.
 """
 
@@ -109,6 +112,9 @@ def build_user_prompt(
     return json.dumps(payload, ensure_ascii=False)
 
 
+class TravelWindowConstraintError(ValueError):
+    pass
+
 def validate_travel_window_constraints(
     request: TripRequest,
     advice: TravelWindowAdvice,
@@ -120,7 +126,7 @@ def validate_travel_window_constraints(
 
         for period in advice.selected_periods:
             if period.start != expected_start or period.end != expected_end:
-                raise ValueError(
+                raise TravelWindowConstraintError(
                     "L'LLM ha violato il vincolo di date esatte indicato dall'utente."
                 )
 
@@ -132,12 +138,12 @@ def validate_travel_window_constraints(
 
         for period in advice.selected_periods:
             if period.start.year != expected_year or period.end.year != expected_year:
-                raise ValueError(
+                raise TravelWindowConstraintError(
                     "L'LLM ha usato un anno diverso da quello risolto dal sistema."
                 )
 
             if period.start.month != request.time_pref.month:
-                raise ValueError(
+                raise TravelWindowConstraintError(
                     "L'LLM ha usato un mese diverso da quello indicato dall'utente."
                 )
 
@@ -145,15 +151,15 @@ def validate_travel_window_constraints(
     max_days = request.time_pref.max_days
 
     for period in advice.selected_periods:
-        duration_days = (period.end - period.start).days
+        duration_days = (period.end - period.start).days + 1
 
         if min_days is not None and duration_days < min_days:
-            raise ValueError(
+            raise TravelWindowConstraintError(
                 "L'LLM ha proposto un periodo più corto della durata minima richiesta."
             )
 
         if max_days is not None and duration_days > max_days:
-            raise ValueError(
+            raise TravelWindowConstraintError(
                 "L'LLM ha proposto un periodo più lungo della durata massima richiesta."
             )
 

@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 import json
 
+from requests.exceptions import Timeout
+from llm.openrouter import OpenRouterError, call_openrouter_json
 from planning import build_proposal, calculate_budget_ceiling
 from routing import route_request
 from pydantic import ValidationError
@@ -674,6 +676,62 @@ class WorkflowTest(unittest.TestCase):
             evaluate_travel_window(request, destination)
 
 
+    def assert_build_proposal_llm_failure(self, expected_reason):
+        request = TripRequest(
+            origin="Rome",
+            budget_eur=900,
+            destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+            time_pref=TimePreference(
+                mode="exact_dates",
+                start_date=date(2026, 9, 15),
+                end_date=date(2026, 9, 20),
+            ),
+        )
+
+        with patch("planning.search_flights") as fake_flights, patch(
+            "planning.search_hotels"
+        ) as fake_hotels:
+            result = build_proposal(request)
+
+        self.assertIsInstance(result, PlanningError)
+        self.assertEqual(result.code, expected_reason.value)
+        failure_events = [
+            event for event in result.trace.events
+            if event.event_type == EventType.TRAVEL_WINDOW_FAILED
+        ]
+        self.assertEqual(len(failure_events), 1)
+        self.assertEqual(failure_events[0].reason_code, expected_reason)
+        self.assertEqual(failure_events[0].details["destination"], "Lisbon")
+        event_types = [event.event_type for event in result.trace.events]
+        self.assertIn(EventType.REQUEST_ROUTED, event_types)
+        self.assertIn(EventType.DESTINATIONS_RESOLVED, event_types)
+        self.assertNotIn(EventType.TRAVEL_WINDOW_EVALUATED, event_types)
+        self.fake_openrouter_call.assert_called_once()
+        fake_flights.assert_not_called()
+        fake_hotels.assert_not_called()
+
+
+    def test_build_proposal_handles_llm_provider_error(self):
+        self.fake_openrouter_call.side_effect = OpenRouterError("Timeout simulato")
+
+        self.assert_build_proposal_llm_failure(ReasonCode.LLM_PROVIDER_ERROR)
+
+
+    def test_build_proposal_handles_invalid_llm_json(self):
+        self.fake_openrouter_call.return_value = "not valid json"
+
+        self.assert_build_proposal_llm_failure(ReasonCode.LLM_OUTPUT_INVALID)
+
+
+    def test_build_proposal_handles_llm_exact_date_violation(self):
+        self.fake_openrouter_call.return_value = fake_travel_window_response(
+            start="2026-10-06",
+            end="2026-10-11",
+        )
+
+        self.assert_build_proposal_llm_failure(ReasonCode.LLM_CONSTRAINT_VIOLATION)
+
+
     def test_resolve_month_year_uses_current_year_for_future_month(self):
         year = resolve_month_year(
             month=8,
@@ -808,6 +866,97 @@ class WorkflowTest(unittest.TestCase):
                 destination,
                 reference_date=date(2026, 6, 7),
             )
+
+
+    def test_hotel_nights_prices_and_budget(self):
+        def search(checkout_day, budget=None):
+            return search_hotels(HotelSearchQuery(
+                destination="Lisbon",
+                checkin_date=date(2026, 9, 15),
+                checkout_date=date(2026, 9, checkout_day),
+                max_total_price_eur=budget,
+            ))
+
+        first = search(18)
+        second = search(22)
+
+        for offers, nights, price in [(first, 3, 285), (second, 7, 665)]:
+            self.assertTrue(offers, "La ricerca deve trovare hotel.")
+            for hotel in offers:
+                self.assertEqual(hotel.nights, nights)
+            by_name = {hotel.name: hotel for hotel in offers}
+            self.assertIn("Central Stay", by_name)
+            self.assertEqual(by_name["Central Stay"].total_price_eur, price)
+
+        limited = search(22, budget=500)
+        self.assertEqual(
+            [(hotel.name, hotel.total_price_eur) for hotel in limited],
+            [("Simple Rooms", 434)],
+        )
+
+
+    def test_hotels_reject_invalid_dates(self):
+        for checkout_day in (15, 14):
+            with self.subTest(checkout_day=checkout_day):
+                query = HotelSearchQuery(
+                    destination="Lisbon",
+                    checkin_date=date(2026, 9, 15),
+                    checkout_date=date(2026, 9, checkout_day),
+                )
+                with self.assertRaises(ValueError):
+                    search_hotels(query)
+
+
+    def test_travel_window_counts_inclusive_days(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=900,
+            destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+            time_pref=TimePreference(mode="flexible_window", min_days=6, max_days=6),
+        )
+        destination = SuggestedDestination(name="Lisbon", reason="Test", match_score=100)
+        self.fake_openrouter_call.return_value = fake_travel_window_response(end="2026-09-20")
+        advice = evaluate_travel_window(request, destination)
+        self.assertEqual(advice.selected_periods[0].end, date(2026, 9, 20))
+
+        self.fake_openrouter_call.return_value = fake_travel_window_response(end="2026-09-21")
+        with self.assertRaisesRegex(ValueError, "durata massima"):
+            evaluate_travel_window(request, destination)
+
+
+@patch.dict("os.environ", {
+    "OPENROUTER_API_KEY": "test-api-key",
+    "OPENROUTER_MODEL": "test-model",
+})
+class OpenRouterClientTest(unittest.TestCase):
+    @patch("llm.openrouter.requests.post")
+    def test_timeout_becomes_openrouter_error(self, fake_post):
+        timeout = Timeout("Timeout simulato")
+        fake_post.side_effect = timeout
+
+        with self.assertRaises(OpenRouterError) as caught:
+            call_openrouter_json(
+                messages=[{"role": "user", "content": "Test"}],
+                response_schema={"type": "object"},
+            )
+
+        self.assertIs(caught.exception.__cause__, timeout)
+        fake_post.assert_called_once()
+
+    @patch("llm.openrouter.requests.post")
+    def test_empty_choices_becomes_openrouter_error(self, fake_post):
+        response = fake_post.return_value
+        response.status_code = 200
+        response.json.return_value = {"choices": []}
+
+        with self.assertRaises(OpenRouterError) as caught:
+            call_openrouter_json(
+                messages=[{"role": "user", "content": "Test"}],
+                response_schema={"type": "object"},
+            )
+
+        self.assertIsInstance(caught.exception.__cause__, IndexError)
+        fake_post.assert_called_once()
+        response.json.assert_called_once()
 
 
 if __name__ == "__main__":

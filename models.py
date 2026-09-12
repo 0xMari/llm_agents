@@ -128,12 +128,14 @@ class HotelSearchQuery(BaseModel):
     max_total_price_eur: int | None = Field(default=None, gt=0)
 
 
-class HotelOffer(BaseModel):
+class Hotel(BaseModel):
     destination: str
     name: str
     nightly_price_eur: int
     rating: float = Field(ge=0, le=5)
-    nights: int
+
+class HotelOffer(Hotel):
+    nights: int = Field(ge=1)
 
     @property
     def total_price_eur(self) -> int:
@@ -149,6 +151,7 @@ class EventType(StrEnum):
     COMBINATION_EXCLUDED = "COMBINATION_EXCLUDED"
     PROPOSALS_SELECTED = "PROPOSALS_SELECTED"
     SEARCH_FAILED = "SEARCH_FAILED"
+    TRAVEL_WINDOW_FAILED = "TRAVEL_WINDOW_FAILED"
 
 
 class ReasonCode(StrEnum):
@@ -166,6 +169,9 @@ class ReasonCode(StrEnum):
     GOOD_HOTEL_RATING = "GOOD_HOTEL_RATING"
     RANKED_BY_SCORE_RATING_PRICE = "RANKED_BY_SCORE_RATING_PRICE"
     NO_AFFORDABLE_PROPOSAL = "NO_AFFORDABLE_PROPOSAL"
+    LLM_PROVIDER_ERROR = "LLM_PROVIDER_ERROR"
+    LLM_OUTPUT_INVALID = "LLM_OUTPUT_INVALID"
+    LLM_CONSTRAINT_VIOLATION = "LLM_CONSTRAINT_VIOLATION"
 
 
 class DecisionEvent(BaseModel):
