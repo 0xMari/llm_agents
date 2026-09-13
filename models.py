@@ -1,5 +1,5 @@
 from typing import Self, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 from datetime import date
 from enum import StrEnum
 
@@ -60,6 +60,25 @@ class SuggestedDestination(BaseModel):
     caution: str | None = None
 
 
+class DestinationCandidate(SuggestedDestination):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    name: str = Field(min_length=1)
+    country: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    themes_matched: list[str]
+    caution: str | None
+
+class DestinationAdvice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    destinations: list[DestinationCandidate] = Field(min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def unique_destinations(self) -> Self:
+        keys = [(d.name.casefold(), d.country.casefold()) for d in self.destinations]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Destinazioni duplicate.")
+        return self
+
 class TravelVibe(BaseModel):
     free_text: str | None = None
     themes: list[str] = Field(default_factory=list)
@@ -68,7 +87,7 @@ class TravelVibe(BaseModel):
 
 class TripRequest(BaseModel):
     origin: str
-    budget_eur: int = Field(gt=0)
+    budget_eur: int | None = Field(default=None, gt=0)
     budget_flexibility_pct: int = Field(default=20, ge=0, le=30)
     destination_pref: DestinationPreference
     time_pref: TimePreference
@@ -144,6 +163,7 @@ class HotelOffer(Hotel):
 
 class EventType(StrEnum):
     DESTINATIONS_RESOLVED = "DESTINATIONS_RESOLVED"
+    DESTINATION_RESOLUTION_FAILED = "DESTINATION_RESOLUTION_FAILED"
     REQUEST_ROUTED = "REQUEST_ROUTED"
     PERIOD_ANALYZED = "PERIOD_ANALYZED"
     TRAVEL_WINDOW_EVALUATED = "TRAVEL_WINDOW_EVALUATED"
@@ -161,6 +181,8 @@ class ReasonCode(StrEnum):
     PERIOD_CANDIDATE = "PERIOD_CANDIDATE"
     TRAVEL_WINDOW_SELECTED = "TRAVEL_WINDOW_SELECTED"
     NO_FLIGHTS_FOUND = "NO_FLIGHTS_FOUND"
+    NO_HOTELS_FOUND = "NO_HOTELS_FOUND"
+    NO_BUDGET_PROVIDED = "NO_BUDGET_PROVIDED"
     WITHIN_BUDGET = "WITHIN_BUDGET"
     OVER_BUDGET = "OVER_BUDGET"
     OVER_PREFERRED_BUDGET = "OVER_PREFERRED_BUDGET"
@@ -177,13 +199,13 @@ class ReasonCode(StrEnum):
 class DecisionEvent(BaseModel):
     event_type: EventType
     reason_code: ReasonCode
-    details: dict[str, str | int | float | bool | list[str]] = Field(default_factory=dict)
+    details: dict[str, str | int | float | bool | list[str] | None] = Field(default_factory=dict)
     comment: str | None = None
 
 
 class ProposalComment(BaseModel):
     reason_code: ReasonCode
-    details: dict[str, str | int | float | bool | list[str]] = Field(default_factory=dict)
+    details: dict[str, str | int | float | bool | list[str] | None] = Field(default_factory=dict)
     comment: str
 
 

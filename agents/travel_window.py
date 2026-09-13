@@ -60,6 +60,10 @@ Non restituire markdown.
 Non inventare voli, hotel o prezzi.
 
 Regole:
+- Il budget riguarda il totale volo e hotel.
+- Se budget_eur e null, non e indicato un limite economico: ignora budget_flexibility_pct e non dedurre una preferenza per il lusso.
+- Con budget presente e flessibilita zero, il budget e un limite rigido; con percentuale positiva e un budget preferito, con limite massimo budget_eur * (100 + budget_flexibility_pct) // 100 in euro interi.
+- Non garantire il rispetto del budget: il planner lo verifica sui prezzi dei provider.
 - Se l'utente ha date esatte, selected_periods deve usare quelle date.
 - Se le date esatte non sono ideali, aggiungi warnings e alternatives.
 - Se l'utente indica mese, stagione o finestra flessibile, proponi periodi coerenti.

@@ -40,15 +40,18 @@ def resolve_destinations(request: TripRequest) -> list[SuggestedDestination]:
     return suggest_destinations(request)
 
 
-def calculate_budget_ceiling(request: TripRequest) -> int:
-    multiplier = 1 + request.budget_flexibility_pct / 100
-    return int(request.budget_eur * multiplier)
+def calculate_budget_ceiling(request: TripRequest) -> int | None:
+    if request.budget_eur is None:
+        return None
+    return request.budget_eur * (100 + request.budget_flexibility_pct) // 100
 
 
 def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
     scenario = route_request(request)
     proposals = []
     events = []
+    found_flights = False
+    found_combinations = False
     budget_ceiling = calculate_budget_ceiling(request)
 
     events.append(
@@ -60,7 +63,28 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
         )
     )
 
-    destinations = resolve_destinations(request)
+    try:
+        destinations = resolve_destinations(request)
+    except (OpenRouterError, ValidationError) as exc:
+        if isinstance(exc, OpenRouterError):
+            reason = ReasonCode.LLM_PROVIDER_ERROR
+        else:
+            reason = ReasonCode.LLM_OUTPUT_INVALID
+
+        events.append(
+            DecisionEvent(
+                event_type=EventType.DESTINATION_RESOLUTION_FAILED,
+                reason_code=reason,
+                details={"agent": "destination"},
+                comment="Selezione delle destinazioni non completata.",
+            )
+        )
+
+        return PlanningError(
+            code=reason.value,
+            message="Non e stato possibile proporre destinazioni.",
+            trace=DecisionTrace(events=events),
+        )
 
     events.append(
         DecisionEvent(
@@ -138,7 +162,6 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                 destination = destination.name,
                 departure_date = period.start,
                 return_date = period.end,
-                max_price_eur = budget_ceiling,
             )
 
             flights = search_flights(flight_query)
@@ -149,6 +172,7 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                         event_type = EventType.SEARCH_FAILED,
                         reason_code = ReasonCode.NO_FLIGHTS_FOUND,
                         details = {
+                            "destination": destination.name,
                             "start": period.start.isoformat(),
                             "end": period.end.isoformat(),
                         },
@@ -157,18 +181,37 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                 )
                 continue
 
+            found_flights = True
+
             for flight in flights:
 
                 hotel_query = HotelSearchQuery(
                     destination = destination.name,
                     checkin_date = period.start,
                     checkout_date = period.end,
-                    max_total_price_eur = budget_ceiling,
                 )
-                for hotel in search_hotels(hotel_query):
+                hotels = search_hotels(hotel_query)
+
+                if not hotels:
+                    events.append(
+                        DecisionEvent(
+                            event_type=EventType.SEARCH_FAILED,
+                            reason_code=ReasonCode.NO_HOTELS_FOUND,
+                            details={
+                                "destination": destination.name,
+                                "start": period.start.isoformat(),
+                                "end": period.end.isoformat(),
+                            },
+                            comment="Nessun hotel trovato per il soggiorno.",
+                        )
+                    )
+                    continue
+
+                for hotel in hotels:
+                    found_combinations = True
                     total_price = flight.price_eur + hotel.total_price_eur
 
-                    if total_price > budget_ceiling:
+                    if budget_ceiling is not None and total_price > budget_ceiling:
                         events.append(
                             DecisionEvent(
                                 event_type = EventType.COMBINATION_EXCLUDED,
@@ -184,7 +227,10 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                             )
                         )
                         continue
-                    if total_price <= request.budget_eur:
+                    if request.budget_eur is None:
+                        budget_reason = ReasonCode.NO_BUDGET_PROVIDED
+                        budget_comment = "Nessun limite di budget indicato."
+                    elif total_price <= request.budget_eur:
                         budget_reason = ReasonCode.WITHIN_BUDGET
                         budget_comment = "Combinazione entro budget."
                     else:
@@ -248,21 +294,31 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                     )
 
     if not proposals:
+        if not found_flights:
+            reason = ReasonCode.NO_FLIGHTS_FOUND
+            message = "Nessun volo trovato per le destinazioni e i periodi cercati."
+        elif not found_combinations:
+            reason = ReasonCode.NO_HOTELS_FOUND
+            message = "Nessun hotel trovato per i soggiorni associati ai voli disponibili."
+        else:
+            reason = ReasonCode.NO_AFFORDABLE_PROPOSAL
+            message = "Le combinazioni trovate superano il budget massimo consentito."
+
         return PlanningError(
-            code = "NO_AFFORDABLE_PROPOSAL",
-            message = "Nessuna combinazione di volo e hotel compatibile con il budget.",
+            code = reason.value,
+            message = message,
             trace = DecisionTrace(events = events),
         )
 
 
-    selected = select_top_proposals(proposals)
+    selected = select_top_proposals(proposals, request)
 
     events.append(
         DecisionEvent(
             event_type = EventType.PROPOSALS_SELECTED,
             reason_code = ReasonCode.RANKED_BY_SCORE_RATING_PRICE,
             details = {"selected_count": len(selected)},
-            comment = "Proposte ordinate e selezionate.",
+            comment = "Proposte ordinate per rispetto del budget, pertinenza, rating e prezzo.",
         )
     )
 

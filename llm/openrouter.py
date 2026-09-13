@@ -14,6 +14,7 @@ class OpenRouterError(Exception):
 def call_openrouter_json(
     messages: list[dict[str, str]],
     response_schema: dict,
+    schema_name: str = "travel_window_advice",
 ) -> str:
     api_key = os.getenv("OPENROUTER_API_KEY")
     model = os.getenv("OPENROUTER_MODEL")
@@ -43,7 +44,7 @@ def call_openrouter_json(
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "travel_window_advice",
+                        "name": schema_name,
                         "strict": True,
                         "schema": response_schema,
                     },

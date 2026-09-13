@@ -13,7 +13,8 @@ from datetime import date
 from providers.flights import search_flights
 from providers.hotels import search_hotels
 
-from scoring import score_proposal
+from scoring import score_proposal, select_top_proposals
+from agents.destination_agent import suggest_destinations
 from agents.travel_window import evaluate_travel_window, resolve_month_year
 
 from models import (
@@ -25,7 +26,9 @@ from models import (
     TravelVibe,
     EventType,
     PlanningScenario,
+    FlightOffer,
     FlightSearchQuery,
+    HotelOffer,
     HotelSearchQuery,
     SuggestedDestination
 )
@@ -52,6 +55,20 @@ def fake_travel_window_response(
         }
     )
 
+
+def fake_flight_and_hotel(total_price: int) -> tuple[FlightOffer, HotelOffer]:
+    hotel = HotelOffer(
+        destination="Lisbon", name="Test Stay",
+        nightly_price_eur=50, nights=5, rating=4.4,
+    )
+    flight = FlightOffer(
+        origin="Rome", destination="Lisbon", airline="Test Air",
+        departure_date=date(2026, 9, 15), return_date=date(2026, 9, 20),
+        price_eur=total_price - hotel.total_price_eur, stops=0,
+    )
+    return flight, hotel
+
+
 class WorkflowTest(unittest.TestCase):
     def setUp(self):
         self.openrouter_patcher = patch("agents.travel_window.call_openrouter_json")
@@ -59,6 +76,24 @@ class WorkflowTest(unittest.TestCase):
         self.addCleanup(self.openrouter_patcher.stop)
 
         self.fake_openrouter_call.return_value = fake_travel_window_response()
+
+        self.destination_patcher = patch(
+            "agents.destination_agent.call_openrouter_json"
+        )
+        self.fake_destination_call = self.destination_patcher.start()
+        self.addCleanup(self.destination_patcher.stop)
+
+        destination = SuggestedDestination(
+            name="Lisbon",
+            country="Portugal",
+            reason="Destinazione simulata per verificare il workflow.",
+            match_score=70,
+        )
+
+        self.fake_destination_call.return_value = json.dumps(
+            {"destinations": [destination.model_dump(mode="json")]},
+            ensure_ascii=False,
+        )
 
 
     def test_proposal_respects_budget(self):
@@ -383,6 +418,7 @@ class WorkflowTest(unittest.TestCase):
         result = build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
+        self.fake_destination_call.assert_not_called()
         for proposal in result.proposals:
             self.assertEqual(proposal.destination.name, "Lisbon")
             self.assertEqual(proposal.destination.match_score, 100)
@@ -405,6 +441,104 @@ class WorkflowTest(unittest.TestCase):
             self.assertIsNotNone(proposal.destination.name)
 
 
+    def test_destination_agent_returns_validated_candidates(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=900,
+            destination_pref=DestinationPreference(mode="open"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+        candidate = json.loads(self.fake_destination_call.return_value)["destinations"][0]
+
+        for names in (["Lisbon"], ["Lisbon", "Porto", "Coimbra"]):
+            with self.subTest(names=names):
+                self.fake_destination_call.return_value = json.dumps({
+                    "destinations": [dict(candidate, name=name) for name in names],
+                })
+
+                destinations = suggest_destinations(request)
+
+                self.assertEqual([destination.name for destination in destinations], names)
+                for destination in destinations:
+                    self.assertIsInstance(destination, SuggestedDestination)
+                    self.assertEqual(destination.country, "Portugal")
+                    self.assertEqual(destination.match_score, candidate["match_score"])
+                self.assertEqual(
+                    self.fake_destination_call.call_args.kwargs["schema_name"],
+                    "destination_advice",
+                )
+        self.fake_openrouter_call.assert_not_called()
+
+
+    def test_destination_agent_rejects_invalid_responses(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=900,
+            destination_pref=DestinationPreference(mode="open"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+        candidate = json.loads(self.fake_destination_call.return_value)["destinations"][0]
+        invalid_candidates = {
+            "empty list": [],
+            "duplicates": [candidate, dict(candidate, name=" lisbon ")],
+            "score too low": [dict(candidate, match_score=-1)],
+            "score too high": [dict(candidate, match_score=101)],
+            "blank name": [dict(candidate, name=" ")],
+            "missing country": [{k: v for k, v in candidate.items() if k != "country"}],
+            "unexpected field": [dict(candidate, price_eur=100)],
+            "too many candidates": [
+                dict(candidate, name=name) for name in ("Lisbon", "Porto", "Coimbra", "Faro")
+            ],
+        }
+        responses = {"invalid JSON": "not valid json"}
+        responses.update({
+            label: json.dumps({"destinations": candidates})
+            for label, candidates in invalid_candidates.items()
+        })
+
+        for label, response in responses.items():
+            with self.subTest(case=label):
+                self.fake_destination_call.return_value = response
+                with self.assertRaises(ValidationError):
+                    suggest_destinations(request)
+
+
+    def assert_destination_failure_stops_workflow(self, expected_reason):
+        request = TripRequest(
+            origin="Rome", budget_eur=900,
+            destination_pref=DestinationPreference(mode="open"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+        with patch("planning.search_flights") as flights, patch(
+            "planning.search_hotels"
+        ) as hotels:
+            result = build_proposal(request)
+
+        self.assertIsInstance(result, PlanningError)
+        self.assertEqual(result.code, expected_reason.value)
+        self.assertEqual(
+            [event.event_type for event in result.trace.events],
+            [EventType.REQUEST_ROUTED, EventType.DESTINATION_RESOLUTION_FAILED],
+        )
+        event = result.trace.events[-1]
+        self.assertEqual(event.reason_code, expected_reason)
+        self.assertEqual(event.details, {"agent": "destination"})
+        self.fake_destination_call.assert_called_once()
+        self.fake_openrouter_call.assert_not_called()
+        flights.assert_not_called()
+        hotels.assert_not_called()
+
+
+    def test_build_proposal_handles_destination_provider_error(self):
+        self.fake_destination_call.side_effect = OpenRouterError("Timeout simulato")
+
+        self.assert_destination_failure_stops_workflow(ReasonCode.LLM_PROVIDER_ERROR)
+
+
+    def test_build_proposal_handles_invalid_destination_json(self):
+        self.fake_destination_call.return_value = "not valid json"
+
+        self.assert_destination_failure_stops_workflow(ReasonCode.LLM_OUTPUT_INVALID)
+
+
     def test_trace_contains_resolved_destinations(self):
         request = TripRequest(
             origin="Rome",
@@ -425,15 +559,154 @@ class WorkflowTest(unittest.TestCase):
 
     
     def test_calculates_budget_ceiling(self):
+        for budget, flexibility, expected in (
+            (1000, 20, 1200),
+            (None, 0, None),
+            (None, 20, None),
+            (None, 30, None),
+            (800, 0, 800),
+            (800, 20, 960),
+            (800, 30, 1040),
+            (100, 13, 113),
+            (999, 20, 1198),
+        ):
+            with self.subTest(budget=budget, flexibility=flexibility):
+                request = TripRequest(
+                    origin="Rome", budget_eur=budget,
+                    budget_flexibility_pct=flexibility,
+                    destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+                    time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+                )
+
+                self.assertEqual(calculate_budget_ceiling(request), expected)
+
+
+    def test_budget_rejects_nonpositive_amounts(self):
+        for budget in (0, -1):
+            with self.subTest(budget=budget):
+                with self.assertRaises(ValidationError):
+                    TripRequest(
+                        origin="Rome", budget_eur=budget,
+                        destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+                        time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+                    )
+
+
+    def test_missing_budget_allows_offers_and_serializes_null_details(self):
+        flight, hotel = fake_flight_and_hotel(total_price=20000)
+        for mode, budget_fields in (
+            ("fixed", {}),
+            ("open", {"budget_eur": None, "budget_flexibility_pct": 30}),
+        ):
+            with self.subTest(mode=mode):
+                request = TripRequest(
+                    origin="Rome",
+                    destination_pref=DestinationPreference(
+                        mode=mode, destination="Lisbon" if mode == "fixed" else None,
+                    ),
+                    time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+                    **budget_fields,
+                )
+                self.assertIsNone(request.budget_eur)
+                with patch("planning.search_flights", return_value=[flight]), patch(
+                    "planning.search_hotels", return_value=[hotel]
+                ):
+                    result = build_proposal(request)
+
+                self.assertNotIsInstance(result, PlanningError)
+                self.assertEqual(len(result.proposals), 1)
+                self.assertEqual(result.proposals[0].total_price_eur, 20000)
+                serialized = json.loads(result.model_dump_json())
+                budget_comments = [
+                    comment for comment in serialized["proposals"][0]["comments"]
+                    if comment["reason_code"] == ReasonCode.NO_BUDGET_PROVIDED.value
+                ]
+                accepted_events = [
+                    event for event in serialized["trace"]["events"]
+                    if event["event_type"] == EventType.COMBINATION_ACCEPTED.value
+                ]
+                self.assertEqual(len(budget_comments), 1)
+                self.assertEqual(len(accepted_events), 1)
+                for entry in budget_comments + accepted_events:
+                    self.assertEqual(entry["reason_code"], ReasonCode.NO_BUDGET_PROVIDED.value)
+                    self.assertIsNone(entry["details"]["budget_eur"])
+                    self.assertIsNone(entry["details"]["budget_ceiling_eur"])
+                reasons = [event.reason_code for event in result.trace.events]
+                self.assertNotIn(ReasonCode.OVER_MAX_BUDGET, reasons)
+                self.assertNotIn(ReasonCode.WITHIN_BUDGET, reasons)
+                self.assertNotIn(ReasonCode.OVER_PREFERRED_BUDGET, reasons)
+
+                calls = [self.fake_openrouter_call]
+                if mode == "open":
+                    calls.append(self.fake_destination_call)
+                for llm_call in calls:
+                    payload = json.loads(llm_call.call_args.kwargs["messages"][1]["content"])
+                    self.assertIsNone(payload["budget_eur"])
+                    self.assertEqual(payload["budget_flexibility_pct"], request.budget_flexibility_pct)
+
+
+    def test_missing_budget_preserves_unavailable_offer_errors(self):
         request = TripRequest(
             origin="Rome",
-            budget_eur=1000,
-            budget_flexibility_pct=20,
             destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
+        flight, _ = fake_flight_and_hotel(total_price=800)
+        for missing_step, expected in (
+            ("flights", ReasonCode.NO_FLIGHTS_FOUND),
+            ("hotels", ReasonCode.NO_HOTELS_FOUND),
+        ):
+            with self.subTest(missing_step=missing_step):
+                flights = [] if missing_step == "flights" else [flight]
+                with patch("planning.search_flights", return_value=flights), patch(
+                    "planning.search_hotels", return_value=[]
+                ):
+                    result = build_proposal(request)
 
-        self.assertEqual(calculate_budget_ceiling(request), 1200)
+                self.assertIsInstance(result, PlanningError)
+                self.assertEqual(result.code, expected.value)
+
+
+    def test_budget_limits_include_the_boundary_and_reject_one_euro_more(self):
+        for flexibility, total, expected_reason in (
+            (0, 800, ReasonCode.WITHIN_BUDGET),
+            (0, 801, ReasonCode.OVER_MAX_BUDGET),
+            (20, 800, ReasonCode.WITHIN_BUDGET),
+            (20, 801, ReasonCode.OVER_PREFERRED_BUDGET),
+            (20, 960, ReasonCode.OVER_PREFERRED_BUDGET),
+            (20, 961, ReasonCode.OVER_MAX_BUDGET),
+        ):
+            with self.subTest(flexibility=flexibility, total=total):
+                request = TripRequest(
+                    origin="Rome", budget_eur=800, budget_flexibility_pct=flexibility,
+                    destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+                    time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+                )
+                flight, hotel = fake_flight_and_hotel(total)
+                with patch("planning.search_flights", return_value=[flight]), patch(
+                    "planning.search_hotels", return_value=[hotel]
+                ):
+                    result = build_proposal(request)
+
+                if expected_reason == ReasonCode.OVER_MAX_BUDGET:
+                    self.assertIsInstance(result, PlanningError)
+                    self.assertEqual(result.code, ReasonCode.NO_AFFORDABLE_PROPOSAL.value)
+                    self.assertEqual(result.trace.events[-1].reason_code, expected_reason)
+                else:
+                    self.assertNotIsInstance(result, PlanningError)
+                    self.assertEqual(len(result.proposals), 1)
+                    proposal = result.proposals[0]
+                    self.assertEqual(proposal.total_price_eur, total)
+                    budget_comments = [
+                        comment for comment in proposal.comments
+                        if comment.reason_code == expected_reason
+                    ]
+                    self.assertEqual(len(budget_comments), 1)
+                    self.assertEqual(budget_comments[0].details["budget_eur"], 800)
+                    self.assertEqual(
+                        budget_comments[0].details["budget_ceiling_eur"],
+                        800 if flexibility == 0 else 960,
+                    )
 
     
     def test_accepts_proposal_within_budget_flexibility(self):
@@ -477,6 +750,148 @@ class WorkflowTest(unittest.TestCase):
         )
 
 
+    def test_no_flights_returns_specific_error(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=900,
+            destination_pref=DestinationPreference(mode="fixed", destination="Kyoto"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+        with patch("planning.search_hotels") as hotels:
+            result = build_proposal(request)
+
+        self.assertIsInstance(result, PlanningError)
+        self.assertEqual(result.code, ReasonCode.NO_FLIGHTS_FOUND.value)
+        self.assertIn("Nessun volo", result.message)
+        event = result.trace.events[-1]
+        self.assertEqual(event.event_type, EventType.SEARCH_FAILED)
+        self.assertEqual(event.reason_code, ReasonCode.NO_FLIGHTS_FOUND)
+        self.assertEqual(event.details, {
+            "destination": "Kyoto", "start": "2026-09-15", "end": "2026-09-20",
+        })
+        hotels.assert_not_called()
+
+
+    def test_no_hotels_returns_specific_error(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=900,
+            destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+        with patch("planning.search_hotels", return_value=[]):
+            result = build_proposal(request)
+
+        self.assertIsInstance(result, PlanningError)
+        self.assertEqual(result.code, ReasonCode.NO_HOTELS_FOUND.value)
+        self.assertIn("Nessun hotel", result.message)
+        failures = [
+            event for event in result.trace.events
+            if event.event_type == EventType.SEARCH_FAILED
+        ]
+        self.assertTrue(failures)
+        for event in failures:
+            self.assertEqual(event.reason_code, ReasonCode.NO_HOTELS_FOUND)
+            self.assertEqual(event.details, {
+                "destination": "Lisbon", "start": "2026-09-15", "end": "2026-09-20",
+            })
+
+
+    def test_over_budget_inventory_is_not_reported_as_missing(self):
+        for budget in (100, 200):
+            with self.subTest(budget=budget):
+                request = TripRequest(
+                    origin="Rome", budget_eur=budget,
+                    destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+                    time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+                )
+
+                result = build_proposal(request)
+
+                self.assertIsInstance(result, PlanningError)
+                self.assertEqual(result.code, ReasonCode.NO_AFFORDABLE_PROPOSAL.value)
+                self.assertIn("budget massimo", result.message)
+                reasons = [event.reason_code for event in result.trace.events]
+                self.assertIn(ReasonCode.OVER_MAX_BUDGET, reasons)
+                self.assertNotIn(ReasonCode.NO_FLIGHTS_FOUND, reasons)
+                self.assertNotIn(ReasonCode.NO_HOTELS_FOUND, reasons)
+
+
+    def test_search_continues_after_period_without_offers(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=900,
+            destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+        advice = json.loads(fake_travel_window_response())
+        later_advice = json.loads(fake_travel_window_response(
+            start="2026-10-06", end="2026-10-11",
+        ))
+        advice["selected_periods"].extend(later_advice["selected_periods"])
+        self.fake_openrouter_call.return_value = json.dumps(advice)
+
+        for missing_step, reason in (
+            ("flights", ReasonCode.NO_FLIGHTS_FOUND),
+            ("hotels", ReasonCode.NO_HOTELS_FOUND),
+        ):
+            with self.subTest(missing_step=missing_step):
+                def available_flights(query):
+                    if missing_step == "flights" and query.departure_date == date(2026, 9, 15):
+                        return []
+                    return search_flights(query)
+
+                def available_hotels(query):
+                    if missing_step == "hotels" and query.checkin_date == date(2026, 9, 15):
+                        return []
+                    return search_hotels(query)
+
+                with patch("planning.search_flights", side_effect=available_flights), patch(
+                    "planning.search_hotels", side_effect=available_hotels
+                ):
+                    result = build_proposal(request)
+
+                self.assertNotIsInstance(result, PlanningError)
+                self.assertTrue(result.proposals)
+                for proposal in result.proposals:
+                    self.assertEqual(proposal.period.start, date(2026, 10, 6))
+                failures = [event for event in result.trace.events if event.reason_code == reason]
+                self.assertTrue(failures)
+                for event in failures:
+                    self.assertEqual(event.details["destination"], "Lisbon")
+                    self.assertEqual(event.details["start"], "2026-09-15")
+
+
+    def test_open_destination_classification_uses_all_candidates(self):
+        lisbon = json.loads(self.fake_destination_call.return_value)["destinations"][0]
+        kyoto = dict(lisbon, name="Kyoto", country="Japan")
+        for destinations in ([kyoto, lisbon], [lisbon, kyoto]):
+            for budget in (100, 900):
+                with self.subTest(first=destinations[0]["name"], budget=budget):
+                    self.fake_destination_call.return_value = json.dumps({
+                        "destinations": destinations,
+                    })
+                    request = TripRequest(
+                        origin="Rome", budget_eur=budget,
+                        destination_pref=DestinationPreference(mode="open"),
+                        time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+                    )
+
+                    result = build_proposal(request)
+
+                    if budget == 100:
+                        self.assertIsInstance(result, PlanningError)
+                        self.assertEqual(result.code, ReasonCode.NO_AFFORDABLE_PROPOSAL.value)
+                    else:
+                        self.assertNotIsInstance(result, PlanningError)
+                        self.assertTrue(result.proposals)
+                        for proposal in result.proposals:
+                            self.assertEqual(proposal.destination.name, "Lisbon")
+                    failures = [
+                        event for event in result.trace.events
+                        if event.reason_code == ReasonCode.NO_FLIGHTS_FOUND
+                    ]
+                    self.assertEqual(len(failures), 1)
+                    self.assertEqual(failures[0].details["destination"], "Kyoto")
+
+
     def test_proposals_are_sorted_by_score(self):
         request = TripRequest(
             origin="Rome",
@@ -490,11 +905,72 @@ class WorkflowTest(unittest.TestCase):
         self.assertNotIsInstance(result, PlanningError)
 
         scores = [
-            score_proposal(proposal)
+            score_proposal(proposal, request)
             for proposal in result.proposals
         ]
 
         self.assertEqual(scores, sorted(scores, reverse=True))
+
+
+    def test_scoring_distinguishes_preferred_and_absent_budget(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=800, budget_flexibility_pct=20,
+            destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+        result = build_proposal(request)
+        self.assertNotIsInstance(result, PlanningError)
+        base = result.proposals[0]
+
+        def proposal_with(total, match_score):
+            return base.model_copy(update={
+                "destination": base.destination.model_copy(update={"match_score": match_score}),
+                "flight": base.flight.model_copy(update={
+                    "price_eur": total - base.hotel.total_price_eur,
+                }),
+                "total_price_eur": total,
+            })
+
+        within_budget = proposal_with(800, 60)
+        better_match = proposal_with(900, 95)
+        for budget, expected in (
+            (800, [within_budget, better_match]),
+            (None, [better_match, within_budget]),
+        ):
+            with self.subTest(budget=budget):
+                current_request = request.model_copy(update={"budget_eur": budget})
+                self.assertEqual(
+                    select_top_proposals([better_match, within_budget], current_request),
+                    expected,
+                )
+                self.assertEqual(
+                    select_top_proposals([better_match, within_budget], current_request, limit=1),
+                    expected[:1],
+                )
+
+        cheaper_same_match = proposal_with(800, 95)
+        no_budget = request.model_copy(update={"budget_eur": None})
+        self.assertEqual(
+            select_top_proposals([better_match, cheaper_same_match], no_budget),
+            [cheaper_same_match, better_match],
+        )
+
+
+    def test_workflow_prioritizes_proposals_within_preferred_budget(self):
+        request = TripRequest(
+            origin="Rome", budget_eur=550, budget_flexibility_pct=20,
+            destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+            time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
+        )
+
+        result = build_proposal(request)
+
+        self.assertNotIsInstance(result, PlanningError)
+        self.assertEqual(
+            [proposal.total_price_eur <= request.budget_eur for proposal in result.proposals],
+            [True, True, False],
+        )
+        self.assertLess(result.proposals[0].hotel.rating, result.proposals[-1].hotel.rating)
     
 
     def test_travel_window_exact_dates_uses_user_dates(self):
