@@ -1,8 +1,11 @@
+from decimal import Decimal
+
 from agents.activities import suggest_activities
 from agents.destination_agent import suggest_destinations
 
-from providers.flights import search_flights
+from providers.flights import FlightLocationError, resolve_city, search_flights, search_id_for
 from providers.hotels import search_hotels
+from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
 
 from scoring import select_top_proposals
 from agents.travel_window import evaluate_travel_window
@@ -40,10 +43,57 @@ def resolve_destinations(request: TripRequest) -> list[SuggestedDestination]:
     return suggest_destinations(request)
 
 
-def calculate_budget_ceiling(request: TripRequest) -> int | None:
+def calculate_budget_ceiling(request: TripRequest) -> Decimal | None:
     if request.budget_eur is None:
         return None
-    return request.budget_eur * (100 + request.budget_flexibility_pct) // 100
+    return Decimal(request.budget_eur) * (100 + request.budget_flexibility_pct) / 100
+
+
+def flight_search_failure(events: list[DecisionEvent], destination: str, error: SerpAPIError | FlightLocationError) -> PlanningError:
+    details: dict[str, str | int | list[str] | None] = {"destination": destination}
+    if isinstance(error, SerpAPIError):
+        details.update(provider_error=error.code, http_status=error.status_code)
+    if isinstance(error, FlightLocationError):
+        reason = ReasonCode.FLIGHT_LOCATION_UNRESOLVED
+        message = str(error)
+        details["location_options"] = error.options
+    elif isinstance(error, SerpAPIResponseError):
+        reason = ReasonCode.FLIGHT_OUTPUT_INVALID
+        message = "La ricerca voli ha restituito dati non utilizzabili."
+    else:
+        reason = ReasonCode.FLIGHT_PROVIDER_ERROR
+        message = "Il servizio di ricerca voli non e disponibile. Verifica configurazione e quota."
+    events.append(DecisionEvent(
+        event_type=EventType.SEARCH_FAILED,
+        reason_code=reason,
+        details=details,
+        comment=message,
+    ))
+    return PlanningError(code=reason.value, message=message, trace=DecisionTrace(events=events))
+
+
+def hotel_search_failure(events: list[DecisionEvent], query: HotelSearchQuery, error: SerpAPIError) -> PlanningError:
+    if isinstance(error, SerpAPIResponseError):
+        reason = ReasonCode.HOTEL_OUTPUT_INVALID
+        message = "La ricerca hotel ha restituito dati non utilizzabili."
+    else:
+        reason = ReasonCode.HOTEL_PROVIDER_ERROR
+        message = "Il servizio di ricerca hotel non e disponibile. Verifica configurazione e quota."
+    events.append(DecisionEvent(
+        event_type=EventType.SEARCH_FAILED,
+        reason_code=reason,
+        details={
+            "destination": query.destination,
+            "location_name": query.location_name,
+            "checkin_date": query.checkin_date.isoformat(),
+            "checkout_date": query.checkout_date.isoformat(),
+            "adults": query.adults,
+            "provider_error": error.code,
+            "http_status": error.status_code,
+        },
+        comment=message,
+    ))
+    return PlanningError(code=reason.value, message=message, trace=DecisionTrace(events=events))
 
 
 def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
@@ -53,6 +103,8 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
     found_flights = False
     found_combinations = False
     budget_ceiling = calculate_budget_ceiling(request)
+    city_cache = {}
+    hotel_cache = {}
 
     events.append(
         DecisionEvent(
@@ -143,6 +195,23 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
 
         periods = window_advice.selected_periods
 
+        destination_text = ", ".join(filter(None, [destination.name, destination.country]))
+        locations = [
+            (request.origin, request.origin_city_id, request.origin_airport_code),
+            (destination_text, request.destination_pref.city_id, request.destination_pref.airport_code),
+        ]
+        search_ids = []
+        try:
+            for text, city_id, airport_code in locations:
+                key = (text, city_id)
+                if key not in city_cache:
+                    city_cache[key] = resolve_city(text, city_id=city_id)
+                search_ids.append(search_id_for(city_cache[key], airport_code))
+        except (SerpAPIError, FlightLocationError) as error:
+            return flight_search_failure(events, destination.name, error)
+
+        destination_city = city_cache[(destination_text, request.destination_pref.city_id)]
+
         for period in periods:
             events.append(
                 DecisionEvent(
@@ -160,11 +229,17 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
             flight_query = FlightSearchQuery(
                 origin = request.origin,
                 destination = destination.name,
+                origin_id = search_ids[0],
+                destination_id = search_ids[1],
                 departure_date = period.start,
                 return_date = period.end,
+                adults = request.adults,
             )
 
-            flights = search_flights(flight_query)
+            try:
+                flights = search_flights(flight_query)
+            except SerpAPIError as error:
+                return flight_search_failure(events, destination.name, error)
 
             if not flights:
                 events.append(
@@ -184,13 +259,30 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
             found_flights = True
 
             for flight in flights:
-
+                checkin = flight.outbound.segments[-1].arrival_local.date()
+                checkout = flight.inbound.segments[0].departure_local.date()
+                if checkout <= checkin:
+                    events.append(DecisionEvent(
+                        event_type=EventType.SEARCH_FAILED,
+                        reason_code=ReasonCode.NO_HOTELS_FOUND,
+                        details={"destination": destination.name},
+                        comment="Le tratte selezionate non lasciano una notte per il soggiorno.",
+                    ))
+                    continue
                 hotel_query = HotelSearchQuery(
                     destination = destination.name,
-                    checkin_date = period.start,
-                    checkout_date = period.end,
+                    location_name = destination_city["name"],
+                    checkin_date = checkin,
+                    checkout_date = checkout,
+                    adults = flight_query.adults,
                 )
-                hotels = search_hotels(hotel_query)
+                stay_key = (hotel_query.location_name, checkin, checkout, hotel_query.adults)
+                if stay_key not in hotel_cache:
+                    try:
+                        hotel_cache[stay_key] = search_hotels(hotel_query)
+                    except SerpAPIError as error:
+                        return hotel_search_failure(events, hotel_query, error)
+                hotels = hotel_cache[stay_key]
 
                 if not hotels:
                     events.append(
@@ -199,8 +291,8 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                             reason_code=ReasonCode.NO_HOTELS_FOUND,
                             details={
                                 "destination": destination.name,
-                                "start": period.start.isoformat(),
-                                "end": period.end.isoformat(),
+                                "start": checkin.isoformat(),
+                                "end": checkout.isoformat(),
                             },
                             comment="Nessun hotel trovato per il soggiorno.",
                         )
@@ -257,7 +349,7 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                             )
                         )
 
-                    if hotel.rating >= 4:
+                    if hotel.rating is not None and hotel.rating >= 4:
                         comments.append(
                             ProposalComment(
                                 reason_code = ReasonCode.GOOD_HOTEL_RATING,

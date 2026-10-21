@@ -1,7 +1,13 @@
 from typing import Self, Literal
-from pydantic import BaseModel, Field, model_validator, ConfigDict
-from datetime import date
+from pydantic import BaseModel, Field, model_validator, ConfigDict, HttpUrl
+from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
+
+
+CITY_ID_PATTERN = r"^/[mg]/[A-Za-z0-9_-]+$"
+AIRPORT_CODE_PATTERN = r"^[A-Z]{3}$"
+FLIGHT_LOCATION_PATTERN = r"^(?:[A-Z]{3}|/[mg]/[A-Za-z0-9_-]+)$"
 
 
 class PlanningScenario(StrEnum):
@@ -43,11 +49,15 @@ class TimePreference(BaseModel):
 class DestinationPreference(BaseModel):
     mode: Literal["fixed", "open"]
     destination: str | None = None
+    city_id: str | None = Field(default=None, pattern=CITY_ID_PATTERN)
+    airport_code: str | None = Field(default=None, pattern=AIRPORT_CODE_PATTERN)
 
     @model_validator(mode="after")
     def validate_destination(self) -> Self:
         if self.mode == "fixed" and not self.destination:
             raise ValueError("Con mode='fixed' devi specificare destination.")
+        if self.mode == "open" and (self.city_id is not None or self.airport_code is not None):
+            raise ValueError("Gli identificativi di arrivo richiedono una destinazione fissa.")
         return self
 
 
@@ -87,6 +97,9 @@ class TravelVibe(BaseModel):
 
 class TripRequest(BaseModel):
     origin: str
+    adults: int = Field(default=1, ge=1)
+    origin_city_id: str | None = Field(default=None, pattern=CITY_ID_PATTERN)
+    origin_airport_code: str | None = Field(default=None, pattern=AIRPORT_CODE_PATTERN)
     budget_eur: int | None = Field(default=None, gt=0)
     budget_flexibility_pct: int = Field(default=20, ge=0, le=30)
     destination_pref: DestinationPreference
@@ -123,42 +136,91 @@ class SuggestedStayLength(BaseModel):
 class FlightSearchQuery(BaseModel):
     origin: str
     destination: str
+    origin_id: str = Field(pattern=FLIGHT_LOCATION_PATTERN)
+    destination_id: str = Field(pattern=FLIGHT_LOCATION_PATTERN)
     departure_date: date
     return_date: date
     adults: int = Field(default=1, ge=1)
     max_price_eur: int | None = Field(default=None, gt=0)
 
+    @model_validator(mode="after")
+    def validate_dates(self) -> Self:
+        if self.return_date <= self.departure_date:
+            raise ValueError("Il ritorno deve essere successivo alla partenza.")
+        return self
+
+class FlightSegment(BaseModel):
+    departure_airport: str = Field(pattern=AIRPORT_CODE_PATTERN)
+    arrival_airport: str = Field(pattern=AIRPORT_CODE_PATTERN)
+    departure_local: datetime
+    arrival_local: datetime
+    airline: str = Field(min_length=1)
+    flight_number: str = Field(min_length=1)
+
+class FlightLeg(BaseModel):
+    segments: list[FlightSegment] = Field(min_length=1)
+    duration_minutes: int = Field(gt=0)
+
+    @property
+    def stops(self) -> int:
+        return len(self.segments) - 1
+
+class OfferRedirect(BaseModel):
+    url: HttpUrl
+    kind: Literal["search", "property_website"]
+    label: str
+
 
 class FlightOffer(BaseModel):
     origin: str
     destination: str
+    outbound: FlightLeg
+    inbound: FlightLeg
     airline: str
     departure_date: date
     return_date: date
-    price_eur: int
+    price_eur: Decimal = Field(ge=0)
     stops: int = Field(ge=0)
+    redirect: OfferRedirect | None = None
+
+    @model_validator(mode="after")
+    def validate_leg_summaries(self) -> Self:
+        if self.departure_date != self.outbound.segments[0].departure_local.date():
+            raise ValueError("La data di partenza non corrisponde all'andata.")
+        if self.return_date != self.inbound.segments[0].departure_local.date():
+            raise ValueError("La data di ritorno non corrisponde alla tratta di ritorno.")
+        if self.stops != self.outbound.stops + self.inbound.stops:
+            raise ValueError("Il numero di scali non corrisponde alle tratte.")
+        return self
 
 
 class HotelSearchQuery(BaseModel):
-    destination: str
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    destination: str = Field(min_length=1)
+    location_name: str | None = Field(default=None, min_length=1)
     checkin_date: date
     checkout_date: date
     adults: int = Field(default=1, ge=1)
     max_total_price_eur: int | None = Field(default=None, gt=0)
 
+    @model_validator(mode="after")
+    def validate_stay_dates(self) -> Self:
+        if self.checkout_date <= self.checkin_date:
+            raise ValueError("Il checkout deve essere successivo al checkin.")
+        return self
+
 
 class Hotel(BaseModel):
     destination: str
-    name: str
-    nightly_price_eur: int
-    rating: float = Field(ge=0, le=5)
+    name: str = Field(min_length=1)
+    nightly_price_eur: Decimal | None = Field(default=None, ge=0)
+    rating: float | None = Field(default=None, ge=0, le=5)
 
 class HotelOffer(Hotel):
     nights: int = Field(ge=1)
-
-    @property
-    def total_price_eur(self) -> int:
-        return self.nightly_price_eur * self.nights
+    total_price_eur: Decimal = Field(ge=0)
+    redirect: OfferRedirect | None = None
 
 
 class EventType(StrEnum):
@@ -181,7 +243,12 @@ class ReasonCode(StrEnum):
     PERIOD_CANDIDATE = "PERIOD_CANDIDATE"
     TRAVEL_WINDOW_SELECTED = "TRAVEL_WINDOW_SELECTED"
     NO_FLIGHTS_FOUND = "NO_FLIGHTS_FOUND"
+    FLIGHT_PROVIDER_ERROR = "FLIGHT_PROVIDER_ERROR"
+    FLIGHT_OUTPUT_INVALID = "FLIGHT_OUTPUT_INVALID"
+    FLIGHT_LOCATION_UNRESOLVED = "FLIGHT_LOCATION_UNRESOLVED"
     NO_HOTELS_FOUND = "NO_HOTELS_FOUND"
+    HOTEL_PROVIDER_ERROR = "HOTEL_PROVIDER_ERROR"
+    HOTEL_OUTPUT_INVALID = "HOTEL_OUTPUT_INVALID"
     NO_BUDGET_PROVIDED = "NO_BUDGET_PROVIDED"
     WITHIN_BUDGET = "WITHIN_BUDGET"
     OVER_BUDGET = "OVER_BUDGET"
@@ -199,13 +266,13 @@ class ReasonCode(StrEnum):
 class DecisionEvent(BaseModel):
     event_type: EventType
     reason_code: ReasonCode
-    details: dict[str, str | int | float | bool | list[str] | None] = Field(default_factory=dict)
+    details: dict[str, Decimal | str | int | float | bool | list[str] | None] = Field(default_factory=dict)
     comment: str | None = None
 
 
 class ProposalComment(BaseModel):
     reason_code: ReasonCode
-    details: dict[str, str | int | float | bool | list[str] | None] = Field(default_factory=dict)
+    details: dict[str, Decimal | str | int | float | bool | list[str] | None] = Field(default_factory=dict)
     comment: str
 
 
@@ -218,7 +285,7 @@ class TripProposal(BaseModel):
     period: SuggestedTimePeriod
     flight: FlightOffer
     hotel: HotelOffer
-    total_price_eur: int
+    total_price_eur: Decimal = Field(ge=0)
     recommendations: list[str]
     comments: list[ProposalComment] = Field(default_factory=list)
 

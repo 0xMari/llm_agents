@@ -1,9 +1,11 @@
+from decimal import Decimal
+
 from models import TripProposal, TripRequest
 
 
 def score_proposal(
     proposal: TripProposal, request: TripRequest
-) -> tuple[int, int, int, float, int]:
+) -> tuple[int, int, int, float, Decimal]:
     within_budget = (
         request.budget_eur is None
         or proposal.total_price_eur <= request.budget_eur
@@ -12,7 +14,7 @@ def score_proposal(
         int(within_budget),
         proposal.destination.match_score,
         proposal.period.score,
-        proposal.hotel.rating,
+        proposal.hotel.rating if proposal.hotel.rating is not None else -1,
         -proposal.total_price_eur,
     )
 
