@@ -65,7 +65,8 @@ def find_city_options(text: str) -> list[dict]:
     })
     cities = {}
     for item in _result_items(response, "suggestions"):
-        if item.get("type") == "region":
+        # Autocomplete can include untyped airports even with exclude_regions.
+        if item.get("type") != "city":
             continue
         _validate_city(item)
         cities[item["id"]] = item

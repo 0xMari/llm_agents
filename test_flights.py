@@ -2,7 +2,9 @@ import contextlib
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 import io
+import json
 import os
+from pathlib import Path
 import runpy
 import unittest
 from unittest.mock import patch
@@ -56,6 +58,11 @@ def fake_city(text, *, city_id=None):
         "id": city_id or f"/m/test_{name.lower().replace(' ', '_')}",
         "airports": [{"id": code} for code in codes],
     }
+
+
+def recorded_rome_autocomplete():
+    path = Path(__file__).resolve().parent / "fixtures" / "serpapi" / "autocomplete_rome.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def fake_flight_search(query):
@@ -263,6 +270,40 @@ class FlightProviderTest(unittest.TestCase):
         self.api.return_value = {"suggestions": [fake_city("Lisbon")]}
         with self.assertRaises(FlightLocationError):
             resolve_city("Rome")
+
+    def test_recorded_autocomplete_ignores_suggestions_without_city_type(self):
+        response = recorded_rome_autocomplete()
+        self.api.return_value = response
+        cities = find_city_options("Rome")
+        self.assertEqual([city["id"] for city in cities], ["/m/06c62", "/m/0rwgm", "/m/097xtf"])
+        self.assertEqual(response, recorded_rome_autocomplete())
+
+    def test_recorded_rome_requires_explicit_selection(self):
+        self.api.return_value = recorded_rome_autocomplete()
+        with self.assertRaises(FlightLocationError) as caught:
+            resolve_city("Rome")
+        self.assertIn("Rome (/m/06c62)", caught.exception.options)
+        self.assertIn("Rome, Georgia, USA (/m/0rwgm)", caught.exception.options)
+        city = resolve_city("Rome", city_id="/m/06c62")
+        self.assertEqual(search_id_for(city), "/m/06c62")
+        self.assertEqual(search_id_for(city, "FCO"), "FCO")
+        with self.assertRaises(FlightLocationError):
+            resolve_city("Rome", city_id="/m/018046")
+
+    def test_autocomplete_without_cities_needs_clarification(self):
+        for kind in (None, "region", "airport", "unknown"):
+            with self.subTest(kind=kind):
+                self.api.return_value = {"suggestions": [{**fake_city("Rome"), "type": kind}]}
+                self.assertEqual(find_city_options("Rome"), [])
+                with self.assertRaises(FlightLocationError):
+                    resolve_city("Rome", city_id="/m/test_rome")
+
+    def test_explicit_city_validation_is_not_relaxed(self):
+        for changes in ({"name": None}, {"name": " "}, {"id": None}, {"id": "bad"}, {"airports": [{"id": "bad"}]}):
+            with self.subTest(changes=changes):
+                self.api.return_value = {"suggestions": [{**fake_city("Rome"), **changes}]}
+                with self.assertRaises(SerpAPIResponseError):
+                    find_city_options("Rome")
 
     def test_missing_city_and_malformed_autocomplete_are_distinct(self):
         self.api.return_value = {"suggestions": []}

@@ -1,0 +1,219 @@
+{
+  "source": {
+    "provider": "serpapi",
+    "engine": "google_hotels",
+    "currency": "EUR",
+    "recorded_at": "2026-10-21T12:36:44.550718+00:00"
+  },
+  "query": {
+    "destination": "Lisbon, Portugal",
+    "location_name": "Lisbon, Portugal",
+    "checkin_date": "2026-12-05",
+    "checkout_date": "2026-12-10",
+    "adults": 1,
+    "max_total_price_eur": null
+  },
+  "response": {
+    "properties": [
+      {
+        "name": "Gli anni '20 di GuestReady - Camera 02",
+        "overall_rating": 4.623134,
+        "rate_per_night": {
+          "extracted_lowest": 54
+        },
+        "total_rate": {
+          "extracted_lowest": 269
+        }
+      },
+      {
+        "name": "Costa do Castelo Lisbon Accomodation - By Grupo Lisboa Alojamentos - Large Double Room",
+        "rate_per_night": {
+          "extracted_lowest": 45
+        },
+        "total_rate": {
+          "extracted_lowest": 226
+        }
+      },
+      {
+        "name": "1924 - Queen Room with Shared Bathroom",
+        "overall_rating": 4.65,
+        "rate_per_night": {
+          "extracted_lowest": 44
+        },
+        "total_rate": {
+          "extracted_lowest": 220
+        }
+      },
+      {
+        "name": "Friendly Hills Bairro Alto - Superior Double with Shared Bathroom",
+        "overall_rating": 5,
+        "rate_per_night": {
+          "extracted_lowest": 48
+        },
+        "total_rate": {
+          "extracted_lowest": 238
+        }
+      },
+      {
+        "name": "Tagus Apartments by Lisbon Village Apartments - Standard Studio 2",
+        "overall_rating": 5,
+        "rate_per_night": {
+          "extracted_lowest": 64
+        },
+        "total_rate": {
+          "extracted_lowest": 319
+        }
+      },
+      {
+        "name": "Sant Jordi Hostels Lisbon",
+        "overall_rating": 4.5,
+        "rate_per_night": {
+          "extracted_lowest": 22
+        },
+        "total_rate": {
+          "extracted_lowest": 112
+        }
+      },
+      {
+        "name": "Lisbon Garden Guest House",
+        "overall_rating": 4.4,
+        "rate_per_night": {
+          "extracted_lowest": 45
+        },
+        "total_rate": {
+          "extracted_lowest": 223
+        }
+      },
+      {
+        "name": "Iberostar Selection Lisboa",
+        "overall_rating": 4.7,
+        "rate_per_night": {
+          "extracted_lowest": 96
+        },
+        "total_rate": {
+          "extracted_lowest": 481
+        }
+      },
+      {
+        "name": "The Central House Lisbon Baixa",
+        "overall_rating": 4.3,
+        "rate_per_night": {
+          "extracted_lowest": 25
+        },
+        "total_rate": {
+          "extracted_lowest": 124
+        }
+      },
+      {
+        "name": "Lumen Hotel & The Lisbon Light Show",
+        "overall_rating": 4.6,
+        "rate_per_night": {
+          "extracted_lowest": 85
+        },
+        "total_rate": {
+          "extracted_lowest": 423
+        }
+      },
+      {
+        "name": "Mama Shelter Lisboa",
+        "overall_rating": 4.5,
+        "rate_per_night": {
+          "extracted_lowest": 82
+        },
+        "total_rate": {
+          "extracted_lowest": 408
+        }
+      },
+      {
+        "name": "ibis Styles Lisboa Centro Liberdade NE",
+        "overall_rating": 4.4,
+        "rate_per_night": {
+          "extracted_lowest": 74
+        },
+        "total_rate": {
+          "extracted_lowest": 369
+        }
+      },
+      {
+        "name": "Lisbon Wine House - Rooms & Suites",
+        "overall_rating": 3.7,
+        "rate_per_night": {
+          "extracted_lowest": 46
+        },
+        "total_rate": {
+          "extracted_lowest": 230
+        }
+      },
+      {
+        "name": "Hotel Luena Lisboa",
+        "overall_rating": 4.3,
+        "rate_per_night": {
+          "extracted_lowest": 81
+        },
+        "total_rate": {
+          "extracted_lowest": 405
+        }
+      },
+      {
+        "name": "InterContinental Lisbon",
+        "overall_rating": 4.6,
+        "rate_per_night": {
+          "extracted_lowest": 127
+        },
+        "total_rate": {
+          "extracted_lowest": 633
+        }
+      },
+      {
+        "name": "Turim Luxe Hotel",
+        "overall_rating": 3.8,
+        "rate_per_night": {
+          "extracted_lowest": 67
+        },
+        "total_rate": {
+          "extracted_lowest": 336
+        }
+      },
+      {
+        "name": "Hotel White Lisboa",
+        "overall_rating": 4.5,
+        "rate_per_night": {
+          "extracted_lowest": 81
+        },
+        "total_rate": {
+          "extracted_lowest": 404
+        }
+      },
+      {
+        "name": "OMID Boutique Hotel",
+        "overall_rating": 4.3,
+        "rate_per_night": {
+          "extracted_lowest": 69
+        },
+        "total_rate": {
+          "extracted_lowest": 347
+        }
+      },
+      {
+        "name": "A Casa das Janelas Com Vista",
+        "overall_rating": 4.8,
+        "rate_per_night": {
+          "extracted_lowest": 85
+        },
+        "total_rate": {
+          "extracted_lowest": 426
+        }
+      },
+      {
+        "name": "Omid Saldanha Hotel",
+        "overall_rating": 3.9,
+        "rate_per_night": {
+          "extracted_lowest": 77
+        },
+        "total_rate": {
+          "extracted_lowest": 385
+        }
+      }
+    ]
+  }
+}

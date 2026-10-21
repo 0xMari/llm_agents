@@ -1,0 +1,41 @@
+{
+  "suggestions": [
+    {
+      "name": "Rome",
+      "type": "city",
+      "id": "/m/06c62",
+      "airports": [
+        {"id": "FCO"},
+        {"id": "CIA"},
+        {"id": "XRJ"},
+        {"id": "IRT"}
+      ]
+    },
+    {
+      "name": "Greater Moncton Rom\u00e9o LeBlanc International Airport",
+      "id": "/m/018046"
+    },
+    {
+      "name": "El Salvador International Airport Saint \u00d3scar Arnulfo Romero y Gald\u00e1mez",
+      "id": "/m/07mz2n"
+    },
+    {
+      "name": "Rome, Georgia, USA",
+      "type": "city",
+      "id": "/m/0rwgm",
+      "airports": [
+        {"id": "ATL"},
+        {"id": "CHA"}
+      ]
+    },
+    {
+      "name": "Font-Romeu-Odeillo-Via, France",
+      "type": "city",
+      "id": "/m/097xtf",
+      "airports": [
+        {"id": "BCN"},
+        {"id": "LEU"}
+      ]
+    }
+  ]
+}

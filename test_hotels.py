@@ -1,6 +1,8 @@
 from copy import deepcopy
 from datetime import date
 from decimal import Decimal
+import json
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +12,9 @@ from models import HotelOffer, HotelSearchQuery
 from providers.hotels import parse_hotel_offer, search_hotels
 from providers.links import parse_redirect
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
+
+
+RECORDED_FIXTURE_DIRECTORY = Path(__file__).resolve().parent / "fixtures" / "serpapi"
 
 
 def raw_hotel(name="Test Stay", total="249.99", nightly="50.01", rating=4.4):
@@ -168,6 +173,44 @@ class HotelProviderTest(unittest.TestCase):
             "properties": [{**raw_hotel(), "link": None, "serpapi_property_details_link": "https://serpapi.com/search.json?property_token=test"}],
         }
         self.assertIsNone(search_hotels(self.query)[0].redirect)
+
+
+class RecordedHotelFixtureTest(unittest.TestCase):
+    def test_recorded_hotel_responses(self):
+        paths = sorted(RECORDED_FIXTURE_DIRECTORY.glob("hotels_*.json"))
+        if not paths:
+            self.skipTest("Fixture reale assente: esegui manualmente record_serpapi.py.")
+        with patch("requests.sessions.Session.request", side_effect=AssertionError("Live HTTP disabled")):
+            for path in paths:
+                with self.subTest(fixture=path.name):
+                    fixture = json.loads(path.read_text(encoding="utf-8"))
+                    self.assertEqual(fixture["source"]["provider"], "serpapi")
+                    self.assertEqual(fixture["source"]["engine"], "google_hotels")
+                    self.assertEqual(fixture["source"]["currency"], "EUR")
+                    query = HotelSearchQuery.model_validate(fixture["query"])
+                    raw_hotels = fixture["response"]["properties"]
+                    self.assertTrue(raw_hotels, "La fixture deve coprire almeno un'offerta reale.")
+                    with patch("providers.hotels.search_serpapi", return_value=fixture["response"]) as api:
+                        offers = search_hotels(query)
+                    api.assert_called_once_with({
+                        "engine": "google_hotels",
+                        "q": f"Hotels in {query.location_name or query.destination}",
+                        "check_in_date": query.checkin_date.isoformat(),
+                        "check_out_date": query.checkout_date.isoformat(),
+                        "adults": query.adults,
+                        "currency": "EUR", "hl": "it", "gl": "it",
+                    })
+                    self.assertEqual(len(offers), len(raw_hotels))
+                    for offer, raw in zip(offers, raw_hotels):
+                        self.assertEqual(offer.name, raw["name"].strip())
+                        self.assertEqual(offer.destination, query.destination)
+                        self.assertEqual(offer.nights, (query.checkout_date - query.checkin_date).days)
+                        self.assertEqual(offer.total_price_eur, Decimal(str(raw["total_rate"]["extracted_lowest"])))
+                        rating = raw.get("overall_rating")
+                        self.assertEqual(offer.rating, float(rating) if rating is not None else None)
+                        nightly = (raw.get("rate_per_night") or {}).get("extracted_lowest")
+                        self.assertEqual(offer.nightly_price_eur, Decimal(str(nightly)) if nightly is not None else None)
+                        self.assertIsNone(offer.redirect)
 
 
 class RedirectTest(unittest.TestCase):
