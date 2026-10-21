@@ -167,8 +167,10 @@ def _build_proposal(
     try:
         destinations = resolve_destinations(request, budget=budget)
     except (OpenRouterError, ValidationError) as exc:
+        details: dict[str, str | int | None] = {"agent": "destination"}
         if isinstance(exc, OpenRouterError):
             reason = ReasonCode.LLM_PROVIDER_ERROR
+            details.update(exc.trace_details())
         else:
             reason = ReasonCode.LLM_OUTPUT_INVALID
 
@@ -176,7 +178,7 @@ def _build_proposal(
             DecisionEvent(
                 event_type=EventType.DESTINATION_RESOLUTION_FAILED,
                 reason_code=reason,
-                details={"agent": "destination"},
+                details=details,
                 comment="Selezione delle destinazioni non completata.",
             )
         )
@@ -214,8 +216,10 @@ def _build_proposal(
         try:
             window_advice = evaluate_travel_window(request, destination, budget=budget)
         except (OpenRouterError, ValidationError, TravelWindowConstraintError) as exc:
+            details = {"destination": destination.name}
             if isinstance(exc, OpenRouterError):
                 reason = ReasonCode.LLM_PROVIDER_ERROR
+                details.update(exc.trace_details())
             elif isinstance(exc, ValidationError):
                 reason = ReasonCode.LLM_OUTPUT_INVALID
             else:
@@ -224,7 +228,7 @@ def _build_proposal(
             events.append(DecisionEvent(
                 event_type=EventType.TRAVEL_WINDOW_FAILED,
                 reason_code=reason,
-                details={"destination": destination.name},
+                details=details,
                 comment="Valutazione del periodo non completata.",
             ))
             return PlanningError(

@@ -550,10 +550,15 @@ class WorkflowTest(unittest.TestCase):
         )
         event = result.trace.events[-1]
         self.assertEqual(event.reason_code, expected_reason)
-        self.assertEqual(event.details, {
+        expected_details = {
             "agent": "destination", "serpapi_calls": 0, "llm_calls": 0,
             **self.limits.model_dump(),
-        })
+        }
+        if expected_reason == ReasonCode.LLM_PROVIDER_ERROR:
+            expected_details.update(
+                llm_error_kind="provider_error", llm_http_status=None, llm_api_code=None,
+            )
+        self.assertEqual(event.details, expected_details)
         self.fake_destination_call.assert_called_once()
         self.fake_openrouter_call.assert_not_called()
         flights.assert_not_called()

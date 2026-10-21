@@ -8,9 +8,122 @@ from execution import RunBudget
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+_ERROR_MESSAGES = {
+    "configuration_error": "Configurazione OpenRouter incompleta.",
+    "timeout": "Tempo di attesa OpenRouter superato.",
+    "network_error": "Connessione a OpenRouter non riuscita.",
+    "authentication_error": "Autenticazione OpenRouter non riuscita.",
+    "payment_required": "OpenRouter richiede una verifica del credito o dei limiti di spesa.",
+    "permission_denied": "Richiesta OpenRouter non consentita.",
+    "rate_limit": "Limite di richieste del provider LLM raggiunto.",
+    "invalid_request": "OpenRouter ha rifiutato i parametri della richiesta.",
+    "not_found": "Risorsa o endpoint OpenRouter non trovato.",
+    "model_incompatible": "Nessun endpoint selezionato supporta i parametri richiesti.",
+    "provider_unavailable": "Provider LLM non disponibile per questa richiesta.",
+    "provider_error": "Il provider LLM ha restituito un errore.",
+    "invalid_response": "OpenRouter ha restituito una risposta non utilizzabile.",
+}
+
+_HTTP_ERROR_KINDS = {
+    400: "invalid_request",
+    401: "authentication_error",
+    402: "payment_required",
+    403: "permission_denied",
+    404: "not_found",
+    408: "timeout",
+    413: "invalid_request",
+    422: "invalid_request",
+    429: "rate_limit",
+    502: "provider_unavailable",
+    503: "provider_unavailable",
+    504: "timeout",
+}
+
+_TYPED_ERROR_KINDS = {
+    "authentication": "authentication_error",
+    "permission_denied": "permission_denied",
+    "content_policy_violation": "permission_denied",
+    "refusal": "permission_denied",
+    "payment_required": "payment_required",
+    "rate_limit_exceeded": "rate_limit",
+    "provider_overloaded": "provider_unavailable",
+    "provider_unavailable": "provider_unavailable",
+    "timeout": "timeout",
+    "not_found": "not_found",
+    "invalid_request": "invalid_request",
+    "invalid_prompt": "invalid_request",
+    "context_length_exceeded": "invalid_request",
+    "max_tokens_exceeded": "invalid_request",
+    "token_limit_exceeded": "invalid_request",
+    "string_too_long": "invalid_request",
+    "payload_too_large": "invalid_request",
+    "unprocessable": "invalid_request",
+    "server": "provider_error",
+}
+
+_UNSUPPORTED_PARAMETER_PREFIXES = (
+    "no endpoints found that support the requested parameters",
+    "this model does not support json_schema",
+    "this model does not support json schema",
+    "this model does not support structured outputs",
+    "this model does not support response_format",
+    "response_format of type json_schema is not supported",
+    "unsupported parameter: response_format",
+)
+
+
+def _status_code(value: object, *, minimum: int = 100) -> int | None:
+    # Do not copy arbitrary provider strings (or booleans) into the trace.
+    return value if type(value) is int and minimum <= value <= 599 else None
+
 
 class OpenRouterError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        kind: str = "provider_error",
+        http_status: int | None = None,
+        api_code: int | None = None,
+    ):
+        self.kind = kind if isinstance(kind, str) and kind in _ERROR_MESSAGES else "provider_error"
+        self.http_status = _status_code(http_status)
+        self.api_code = _status_code(api_code, minimum=400)
+        super().__init__(message if message is not None else _ERROR_MESSAGES[self.kind])
+
+    def trace_details(self) -> dict[str, str | int | None]:
+        return {
+            "llm_error_kind": self.kind,
+            "llm_http_status": self.http_status,
+            "llm_api_code": self.api_code,
+        }
+
+
+def _provider_error(http_status: int, payload: object = None) -> OpenRouterError:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        kind = _HTTP_ERROR_KINDS.get(http_status, "provider_error") if http_status >= 400 else "invalid_response"
+        return OpenRouterError(kind=kind, http_status=http_status)
+
+    api_code = _status_code(error.get("code"), minimum=400)
+    code = api_code if api_code is not None else http_status
+    kind = _HTTP_ERROR_KINDS.get(code, "provider_error")
+    metadata = error.get("metadata")
+    error_type = metadata.get("error_type") if isinstance(metadata, dict) else None
+    typed_kind = _TYPED_ERROR_KINDS.get(error_type) if isinstance(error_type, str) else None
+
+    # Recognize only explicit diagnostics, never echoed prompts in metadata.raw.
+    message = error.get("message")
+    if code in (400, 404, 422, 503) and isinstance(message, str):
+        normalized = " ".join(message[:1024].lower().split())
+        if normalized.startswith(_UNSUPPORTED_PARAMETER_PREFIXES):
+            kind = "model_incompatible"
+
+    # A recognized structured provider category is more precise than HTTP alone.
+    if typed_kind is not None:
+        if kind != "model_incompatible" or typed_kind not in ("invalid_request", "not_found", "provider_unavailable"):
+            kind = typed_kind
+    return OpenRouterError(kind=kind, http_status=http_status, api_code=api_code)
 
 
 def call_openrouter_json(
@@ -23,11 +136,11 @@ def call_openrouter_json(
     api_key = os.getenv("OPENROUTER_API_KEY")
     model = os.getenv("OPENROUTER_MODEL")
 
-    if not api_key:
-        raise OpenRouterError("OPENROUTER_API_KEY non configurata.")
+    if not api_key or not api_key.strip():
+        raise OpenRouterError("OPENROUTER_API_KEY non configurata.", kind="configuration_error")
 
-    if not model:
-        raise OpenRouterError("OPENROUTER_MODEL non configurato.")
+    if not model or not model.strip():
+        raise OpenRouterError("OPENROUTER_MODEL non configurato.", kind="configuration_error")
 
     if budget is not None:
         budget.claim("llm")
@@ -58,18 +171,34 @@ def call_openrouter_json(
             },
             timeout=60,
         )
+    except requests.Timeout as exc:
+        raise OpenRouterError(kind="timeout") from exc
     except requests.RequestException as exc:
-        raise OpenRouterError("Chiamata OpenRouter non riuscita.") from exc
-
-    if response.status_code >= 400:
-        raise OpenRouterError(response.text)
+        raise OpenRouterError(kind="network_error") from exc
 
     try:
-        content = response.json()["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise OpenRouterError("Struttura della risposta OpenRouter non valida.") from exc
+        payload = response.json()
+    except ValueError as exc:
+        if response.status_code >= 400:
+            raise _provider_error(response.status_code) from exc
+        raise OpenRouterError(kind="invalid_response", http_status=response.status_code) from exc
+
+    if response.status_code >= 400:
+        raise _provider_error(response.status_code, payload)
+
+    if not isinstance(payload, dict):
+        raise OpenRouterError(kind="invalid_response", http_status=response.status_code)
+
+    # Generation can fail after HTTP 200 has already been sent.
+    if "error" in payload and payload["error"] is not None:
+        raise _provider_error(response.status_code, payload)
+
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise OpenRouterError(kind="invalid_response", http_status=response.status_code) from exc
 
     if not isinstance(content, str) or not content.strip():
-        raise OpenRouterError("OpenRouter non ha restituito contenuto testuale.")
+        raise OpenRouterError(kind="invalid_response", http_status=response.status_code)
 
     return content
