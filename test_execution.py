@@ -8,12 +8,13 @@ from requests.exceptions import Timeout
 
 from execution import RunBudget, SearchLimitExceeded, SearchLimits
 from llm.openrouter import OpenRouterError, call_openrouter_json
-from models import DestinationPreference, EventType, PlanningError, TimePreference, TripRequest, TripSearchResult
+from models import DestinationPreference, EventType, PlanningError, ReasonCode, TimePreference, TripRequest, TripSearchResult
 from planning import build_proposal
 from providers.flights import FlightLocationError, find_city_options, search_flights
 from providers.serpapi_client import SerpAPIError, search
 from test_flights import fake_city, raw_leg, recorded_rome_autocomplete
 from test_hotels import raw_hotel
+from test_proposal_summary import fake_summary_response
 
 
 def http_response(payload, status=200):
@@ -158,6 +159,8 @@ class PlannerLimitsTest(unittest.TestCase):
         self.periods = [self.period(self.start, 80)]
         self.destinations = [self.destination("Lisbon", "Portugal", 90)]
         self.no_flights = False
+        self.summary_content = None
+        self.summary_transport_error = None
         self.request = TripRequest(
             origin="Rome", origin_city_id="/m/06c62", budget_eur=900,
             destination_pref=DestinationPreference(mode="fixed", destination="Lisbon", city_id="/m/04llb"),
@@ -180,6 +183,13 @@ class PlannerLimitsTest(unittest.TestCase):
         name = kwargs["json"]["response_format"]["json_schema"]["name"]
         if name == "destination_advice":
             payload = {"destinations": self.destinations}
+        elif name == "proposal_summaries":
+            if self.summary_transport_error is not None:
+                raise self.summary_transport_error
+            content = self.summary_content
+            if content is None:
+                content = fake_summary_response(kwargs["json"]["messages"])
+            return http_response({"choices": [{"message": {"content": content}}]})
         else:
             self.assertEqual(name, "travel_window_advice")
             payload = {"selected_periods": self.periods, "warnings": [], "alternatives": [], "rationale": "Test advice"}
@@ -212,15 +222,27 @@ class PlannerLimitsTest(unittest.TestCase):
         original_request = self.request.model_dump()
         result = build_proposal(self.request, limits=SearchLimits())
         self.assertIsInstance(result, TripSearchResult)
-        self.assertEqual(len(result.proposals), 2)
+        self.assertEqual(len(result.proposals), 1)
+        self.assertEqual(result.proposals[0].selection_profiles, ["cheapest", "comfortable"])
+        self.assertEqual(result.proposals[0].comparison.proposal_id, "p1")
+        self.assertEqual(result.proposals[0].comparison.reference_id, "p1")
+        self.assertEqual(result.proposals[0].comparison.extra_price_eur, 0)
+        self.assertEqual(result.proposals[0].comparison.stops_delta, 0)
+        self.assertEqual(result.proposals[0].comparison.duration_delta_minutes, 0)
+        self.assertEqual(result.proposals[0].comparison.early_departures_delta, 0)
+        self.assertEqual(result.trace.events[-1].details["selected_count"], 1)
+        self.assertNotIn("selected_group_count", result.trace.events[-1].details)
+        self.assertNotIn("selected_variant_count", result.trace.events[-1].details)
         self.assertEqual(self.get.call_count, 5)
-        self.post.assert_called_once()
+        self.assertEqual(self.post.call_count, 2)
+        self.assertEqual(result.summary_status, "generated")
+        self.assertEqual(result.proposals[0].summary.proposal_id, "p1")
         self.assertEqual([call.kwargs["params"]["engine"] for call in self.get.call_args_list], [
             "google_flights_autocomplete", "google_flights_autocomplete",
             "google_flights", "google_flights", "google_hotels",
         ])
         self.assertEqual(result.trace.events[-1].details["serpapi_calls"], 5)
-        self.assertEqual(result.trace.events[-1].details["llm_calls"], 1)
+        self.assertEqual(result.trace.events[-1].details["llm_calls"], 2)
         self.assertEqual(self.request.model_dump(), original_request)
 
     def test_serpapi_limit_stops_before_each_stage_without_partial_success(self):
@@ -256,15 +278,19 @@ class PlannerLimitsTest(unittest.TestCase):
 
     def test_destinations_are_ranked_and_capped_before_window_calls(self):
         self.destinations = [self.destination("Kyoto", "Japan", 50), self.destination("Lisbon", "Portugal", 90)]
-        result = build_proposal(self.open_request(), limits=SearchLimits(max_llm_calls=2))
+        result = build_proposal(self.open_request(), limits=SearchLimits(max_llm_calls=3))
         self.assertIsInstance(result, TripSearchResult)
-        self.assertEqual(self.post.call_count, 2)
+        self.assertEqual(self.post.call_count, 3)
+        self.assertEqual(result.summary_status, "generated")
         self.assertEqual(self.get.call_count, 5)
-        self.assertTrue(all(proposal.destination.name == "Lisbon" for proposal in result.proposals))
+        self.assertTrue(all(
+            proposal.destination.name == "Lisbon"
+            for proposal in result.proposals
+        ))
         scope = next(event for event in result.trace.events if event.event_type == EventType.SEARCH_SCOPE_REDUCED)
         self.assertEqual(scope.details["scope"], "destinations")
         self.assertEqual((scope.details["available_count"], scope.details["selected_count"]), (2, 1))
-        self.assertEqual(result.trace.events[-1].details["llm_calls"], 2)
+        self.assertEqual(result.trace.events[-1].details["llm_calls"], 3)
 
     def test_periods_are_ranked_and_deduplicated_before_the_cap(self):
         second, third = self.start + timedelta(days=7), self.start + timedelta(days=14)
@@ -272,7 +298,7 @@ class PlannerLimitsTest(unittest.TestCase):
         result = build_proposal(self.flexible_request(), limits=SearchLimits(max_periods_per_destination=2, max_serpapi_calls=8))
         self.assertIsInstance(result, TripSearchResult)
         self.assertEqual(self.get.call_count, 8)
-        self.post.assert_called_once()
+        self.assertEqual(self.post.call_count, 2)
         queries = [call.kwargs["params"] for call in self.get.call_args_list]
         outbounds = [query for query in queries if query["engine"] == "google_flights" and "departure_token" not in query]
         self.assertEqual([query["outbound_date"] for query in outbounds], [self.start.isoformat(), second.isoformat()])
@@ -305,9 +331,9 @@ class PlannerLimitsTest(unittest.TestCase):
             result = build_proposal(self.request, limits=limits)
             self.assertIsInstance(result, TripSearchResult)
             self.assertEqual(result.trace.events[-1].details["serpapi_calls"], 5)
-            self.assertEqual(result.trace.events[-1].details["llm_calls"], 1)
+            self.assertEqual(result.trace.events[-1].details["llm_calls"], 2)
         self.assertEqual(self.get.call_count, 10)
-        self.assertEqual(self.post.call_count, 2)
+        self.assertEqual(self.post.call_count, 4)
 
     def test_empty_results_at_exact_limit_are_not_limit_exhaustion(self):
         self.no_flights = True
@@ -331,6 +357,100 @@ class PlannerLimitsTest(unittest.TestCase):
         self.assertEqual(result.trace.events[-1].details["llm_calls"], 1)
         self.assertEqual(result.trace.events[-1].details["serpapi_calls"], 0)
         self.get.assert_not_called()
+
+    def assert_summary_unavailable(self, result, reason, *, calls=2):
+        self.assertIsInstance(result, TripSearchResult)
+        self.assertEqual(result.summary_status, "unavailable")
+        self.assertTrue(result.proposals)
+        self.assertTrue(all(p.summary is None and p.comparison is not None for p in result.proposals))
+        self.assertTrue(all(p.travel_context.rationale == "Test advice" for p in result.proposals))
+        failure = result.trace.events[-2]
+        self.assertEqual(failure.event_type, EventType.PROPOSAL_SUMMARY_FAILED)
+        self.assertEqual(failure.reason_code, reason)
+        self.assertEqual(failure.details["agent"], "proposal_summary")
+        self.assertEqual(result.trace.events[-1].event_type, EventType.PROPOSALS_SELECTED)
+        self.assertEqual(result.trace.events[-1].details["summary_status"], "unavailable")
+        self.assertEqual(result.trace.events[-1].details["llm_calls"], calls)
+        self.assertEqual(self.post.call_count, calls)
+        self.assertEqual(self.get.call_count, 5)
+        self.assertEqual(TripSearchResult.model_validate_json(result.model_dump_json()), result)
+        return failure
+
+    def test_summary_budget_exhaustion_preserves_offers_without_extra_http(self):
+        for mode, calls in (("fixed", 1), ("open", 2)):
+            with self.subTest(mode=mode):
+                self.get.reset_mock()
+                self.post.reset_mock()
+                request = self.request if mode == "fixed" else self.open_request()
+                result = build_proposal(request, limits=SearchLimits(max_llm_calls=calls))
+                failure = self.assert_summary_unavailable(result, ReasonCode.SEARCH_LIMIT_REACHED, calls=calls)
+                self.assertEqual(failure.details, {
+                    "agent": "proposal_summary", "service": "llm", "used": calls, "limit": calls,
+                })
+
+    def test_summary_timeout_preserves_offers_and_safe_diagnostics(self):
+        self.summary_transport_error = Timeout("PRIVATE-PROMPT PRIVATE-KEY")
+        result = build_proposal(self.request, limits=SearchLimits())
+        failure = self.assert_summary_unavailable(result, ReasonCode.LLM_PROVIDER_ERROR)
+        self.assertEqual(failure.details["llm_error_kind"], "timeout")
+        self.assertNotIn("PRIVATE", result.model_dump_json())
+
+    def test_summary_remote_error_preserves_http_diagnostics_not_body(self):
+        original = self.llm_response
+
+        def response(url, **kwargs):
+            if kwargs["json"]["response_format"]["json_schema"]["name"] == "proposal_summaries":
+                return http_response({"error": {"code": 429, "message": "PRIVATE-KEY"}}, status=429)
+            return original(url, **kwargs)
+
+        self.post.side_effect = response
+        result = build_proposal(self.request, limits=SearchLimits())
+        failure = self.assert_summary_unavailable(result, ReasonCode.LLM_PROVIDER_ERROR)
+        self.assertEqual(failure.details["llm_error_kind"], "rate_limit")
+        self.assertEqual(failure.details["llm_http_status"], 429)
+        self.assertEqual(failure.details["llm_api_code"], 429)
+        self.assertNotIn("PRIVATE-KEY", result.model_dump_json())
+
+    def test_invalid_summary_json_and_schema_preserve_offers(self):
+        for content in ("PRIVATE-INVALID-JSON", json.dumps({"items": [], "private": "PRIVATE"})):
+            with self.subTest(content=content):
+                self.get.reset_mock()
+                self.post.reset_mock()
+                self.summary_content = content
+                result = build_proposal(self.request, limits=SearchLimits())
+                self.assert_summary_unavailable(result, ReasonCode.LLM_OUTPUT_INVALID)
+                self.assertNotIn("PRIVATE", result.model_dump_json())
+
+    def test_invalid_summary_ids_preserve_offers_without_partial_text(self):
+        for ids in (["unknown"], ["p1", "p1"], ["p1", "unknown"]):
+            with self.subTest(ids=ids):
+                self.get.reset_mock()
+                self.post.reset_mock()
+                self.summary_content = json.dumps({"items": [
+                    {"proposal_id": id_, "title": "PRIVATE", "advantage": "PRIVATE", "tradeoff": None}
+                    for id_ in ids
+                ]})
+                result = build_proposal(self.request, limits=SearchLimits())
+                self.assert_summary_unavailable(result, ReasonCode.LLM_CONSTRAINT_VIOLATION)
+                self.assertNotIn("PRIVATE", result.model_dump_json())
+
+    def test_summary_success_and_failure_leave_identical_offer_facts(self):
+        success = build_proposal(self.request, limits=SearchLimits())
+        self.summary_content = "invalid JSON"
+        failure = build_proposal(self.request, limits=SearchLimits())
+        self.assertEqual(
+            [p.model_dump(exclude={"summary"}) for p in success.proposals],
+            [p.model_dump(exclude={"summary"}) for p in failure.proposals],
+        )
+        self.assertEqual(success.summary_status, "generated")
+        self.assertEqual(failure.summary_status, "unavailable")
+
+    def test_no_summary_attempt_without_selected_offers(self):
+        self.no_flights = True
+        result = build_proposal(self.request, limits=SearchLimits())
+        self.assertIsInstance(result, PlanningError)
+        self.post.assert_called_once()
+        self.assertNotIn(EventType.PROPOSAL_SUMMARY_FAILED, [e.event_type for e in result.trace.events])
 
 
 if __name__ == "__main__":

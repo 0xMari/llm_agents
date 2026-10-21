@@ -1,15 +1,17 @@
 from decimal import Decimal
 
+from comparison import add_comparisons
 from execution import RunBudget, SearchLimitExceeded, SearchLimits
 
 from agents.activities import suggest_activities
 from agents.destination_agent import suggest_destinations
+from agents.proposal_summary import InvalidProposalSummary, summarize_proposals
 
 from providers.flights import FlightLocationError, resolve_city, search_flights, search_id_for
 from providers.hotels import search_hotels
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
 
-from scoring import select_top_proposals
+from scoring import select_final_proposals
 from agents.travel_window import evaluate_travel_window
 
 from models import (
@@ -20,6 +22,7 @@ from models import (
     HotelSearchQuery,
     PlanningError,
     ProposalComment,
+    ProposalTravelContext,
     ReasonCode,
     SuggestedDestination,
     TripProposal,
@@ -449,6 +452,11 @@ def _build_proposal(
                             total_price_eur = total_price,
                             recommendations = suggest_activities(request),
                             comments = comments,
+                            travel_context = ProposalTravelContext(
+                                warnings=window_advice.warnings,
+                                rationale=window_advice.rationale,
+                                alternatives=window_advice.alternatives,
+                            ),
                         )
                     )
 
@@ -470,18 +478,54 @@ def _build_proposal(
         )
 
 
-    selected = select_top_proposals(proposals, request)
+    early_hour = 9
+    selected = select_final_proposals(proposals, request, early_hour=early_hour)
+    selected = add_comparisons(selected, early_hour=early_hour)
+
+    summary_status = "unavailable"
+    try:
+        selected = summarize_proposals(request, selected, budget=budget, early_hour=early_hour)
+    except (OpenRouterError, ValidationError, InvalidProposalSummary, SearchLimitExceeded) as exc:
+        details = {"agent": "proposal_summary"}
+        if isinstance(exc, OpenRouterError):
+            reason = ReasonCode.LLM_PROVIDER_ERROR
+            details.update(exc.trace_details())
+        elif isinstance(exc, SearchLimitExceeded):
+            reason = ReasonCode.SEARCH_LIMIT_REACHED
+            details.update(service=exc.service, used=exc.used, limit=exc.limit)
+        elif isinstance(exc, InvalidProposalSummary):
+            reason = ReasonCode.LLM_CONSTRAINT_VIOLATION
+        else:
+            reason = ReasonCode.LLM_OUTPUT_INVALID
+        events.append(DecisionEvent(
+            event_type=EventType.PROPOSAL_SUMMARY_FAILED,
+            reason_code=reason,
+            details=details,
+            comment="Sintesi non disponibile: le offerte e i confronti restano utilizzabili.",
+        ))
+    else:
+        summary_status = "generated"
+        events.append(DecisionEvent(
+            event_type=EventType.PROPOSAL_SUMMARY_GENERATED,
+            reason_code=ReasonCode.PROPOSAL_SUMMARY_GENERATED,
+            details={"summarized_count": len(selected)},
+            comment="Sintesi aggiunta senza modificare offerte e confronti.",
+        ))
 
     events.append(
         DecisionEvent(
             event_type = EventType.PROPOSALS_SELECTED,
-            reason_code = ReasonCode.RANKED_BY_SCORE_RATING_PRICE,
-            details = {"selected_count": len(selected)},
-            comment = "Proposte ordinate per rispetto del budget, pertinenza, rating e prezzo.",
+            reason_code = ReasonCode.SELECTED_BY_TRADEOFF,
+            details = {
+                "selected_count": len(selected),
+                "summary_status": summary_status,
+            },
+            comment = "Selezionate fino a tre combinazioni per prezzo e comodita del volo, nel rispetto del budget.",
         )
     )
 
     return TripSearchResult(
         proposals=selected,
+        summary_status=summary_status,
         trace = DecisionTrace(events=events),
     )

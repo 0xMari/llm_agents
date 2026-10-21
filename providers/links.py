@@ -7,14 +7,14 @@ from pydantic import HttpUrl, ValidationError
 from models import OfferRedirect
 
 
-def parse_redirect(raw_url: object, *, kind: Literal["search", "property_website"]) -> OfferRedirect | None:
+def parse_public_url(raw_url: object) -> HttpUrl | None:
     if not isinstance(raw_url, str):
         return None
     try:
         url = HttpUrl(raw_url)
     except ValidationError:
         return None
-    host = (url.host or "").lower()
+    host = (url.host or "").lower().rstrip(".")
     path = url.path or ""
     if (
         url.username or url.password
@@ -23,13 +23,34 @@ def parse_redirect(raw_url: object, *, kind: Literal["search", "property_website
         or any(key.casefold() == "api_key" for key, _ in parse_qsl(url.query or ""))
     ):
         return None
-    if kind == "search" and (
-        not re.fullmatch(r"(?:www\.)?google\.(?:[a-z]{2,3}|(?:com|co)\.[a-z]{2})", host)
-        or not (path == "/travel/flights" or path.startswith("/travel/flights/") or path == "/flights")
-    ):
+    return url
+
+
+def parse_redirect(
+    raw_url: object, *, kind: Literal["search", "property_website", "hotel_search"]
+) -> OfferRedirect | None:
+    url = parse_public_url(raw_url)
+    if url is None:
         return None
+    if kind in ("search", "hotel_search"):
+        host = (url.host or "").lower().rstrip(".")
+        path = url.path or ""
+        paths = ("/travel/flights",) if kind == "search" else ("/travel/hotels", "/travel/search")
+        allowed_path = any(path == prefix or path.startswith(prefix + "/") for prefix in paths)
+        if kind == "search" and path == "/flights":
+            allowed_path = True
+        if (
+            not re.fullmatch(r"(?:www\.)?google\.(?:[a-z]{2,3}|(?:com|co)\.[a-z]{2})", host)
+            or not allowed_path
+        ):
+            return None
+    labels = {
+        "search": "Apri la ricerca voli",
+        "property_website": "Apri la pagina dell'alloggio",
+        "hotel_search": "Apri la ricerca hotel",
+    }
     return OfferRedirect(
         url=url,
         kind=kind,
-        label="Apri la ricerca voli" if kind == "search" else "Visita il sito della struttura",
+        label=labels[kind],
     )

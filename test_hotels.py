@@ -28,6 +28,30 @@ def raw_hotel(name="Test Stay", total="249.99", nightly="50.01", rating=4.4):
     }
 
 
+def detailed_raw_hotel(**kwargs):
+    # API-shaped details for offline tests, not a new real-data recording.
+    return {
+        **raw_hotel(**kwargs),
+        "property_token": "test-property-token",
+        "description": "Hotel with a pool and restaurant.",
+        "address": "Test street, Lisbon",
+        "hotel_class": "4-star hotel",
+        "extracted_hotel_class": 4,
+        "reviews": 128,
+        "gps_coordinates": {"latitude": 38.7223, "longitude": -9.1393},
+        "check_in_time": "3:00 PM",
+        "check_out_time": "11:00 AM",
+        "amenities": ["Free Wi-Fi", "Pool"],
+        "excluded_amenities": ["No beach access"],
+        "essential_info": ["Private room"],
+        "images": [{
+            "thumbnail": "https://images.example/thumbnail.jpg",
+            "original_image": "https://images.example/original.jpg",
+        }],
+        "serpapi_property_details_link": "https://serpapi.com/search.json?property_token=test-property-token",
+    }
+
+
 def fake_hotel_search(query, *, budget=None):
     if query.destination != "Lisbon":
         return []
@@ -164,7 +188,7 @@ class HotelProviderTest(unittest.TestCase):
     def test_public_website_has_explicit_redirect_kind(self):
         hotel = search_hotels(self.query)[0]
         self.assertEqual(hotel.redirect.kind, "property_website")
-        self.assertEqual(hotel.redirect.label, "Visita il sito della struttura")
+        self.assertEqual(hotel.redirect.label, "Apri la pagina dell'alloggio")
         self.assertEqual(hotel.model_dump(mode="json")["redirect"]["url"], "https://hotel.example/stay")
 
     def test_api_links_and_rpc_metadata_are_not_used_as_redirects(self):
@@ -172,7 +196,198 @@ class HotelProviderTest(unittest.TestCase):
             "search_metadata": {"google_hotels_url": "https://www.google.com/_/TravelFrontendUi/data/batchexecute"},
             "properties": [{**raw_hotel(), "link": None, "serpapi_property_details_link": "https://serpapi.com/search.json?property_token=test"}],
         }
-        self.assertIsNone(search_hotels(self.query)[0].redirect)
+        offer = search_hotels(self.query)[0]
+        self.assertIsNone(offer.redirect)
+        self.assertIsNone(offer.search_redirect)
+
+    def test_available_details_and_token_are_preserved_without_extra_requests(self):
+        raw = detailed_raw_hotel()
+        self.api.return_value = {"properties": [raw]}
+        hotel = search_hotels(self.query)[0]
+        self.api.assert_called_once()
+        self.assertEqual(hotel.property_token, "test-property-token")
+        self.assertEqual(hotel.rating, 4.4)
+        self.assertEqual(hotel.details.property_type, "hotel")
+        self.assertEqual(hotel.details.description, raw["description"])
+        self.assertEqual(hotel.details.address, raw["address"])
+        self.assertEqual(hotel.details.hotel_class, "4-star hotel")
+        self.assertEqual(hotel.details.stars, 4)
+        self.assertEqual(hotel.details.reviews, 128)
+        self.assertEqual(hotel.details.gps_coordinates.model_dump(), raw["gps_coordinates"])
+        self.assertEqual(hotel.details.check_in_time, "3:00 PM")
+        self.assertEqual(hotel.details.check_out_time, "11:00 AM")
+        self.assertEqual(hotel.details.amenities, ["Free Wi-Fi", "Pool"])
+        self.assertEqual(hotel.details.excluded_amenities, ["No beach access"])
+        self.assertEqual(hotel.details.essential_info, ["Private room"])
+        self.assertEqual(hotel.details.images[0].model_dump(mode="json"), raw["images"][0])
+        self.assertEqual(hotel.nights, 5)
+        self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
+        self.assertEqual(hotel.vibe_match_status, "not_verified")
+        self.assertEqual(HotelOffer.model_validate_json(hotel.model_dump_json()), hotel)
+
+    def test_details_response_is_enriched_like_search_results(self):
+        self.api.return_value = {
+            **detailed_raw_hotel(),
+            "search_information": {"hotels_results_state": "Showing results for property details"},
+        }
+        hotel = search_hotels(self.query)[0]
+        self.assertEqual(hotel.property_token, "test-property-token")
+        self.assertEqual(hotel.details.stars, 4)
+        self.api.assert_called_once()
+
+    def test_missing_details_are_unknown_not_fabricated(self):
+        raw = {"name": "Beach Hotel", "total_rate": {"extracted_lowest": "100"}}
+        hotel = parse_hotel_offer(raw, self.query)
+        self.assertIsNone(hotel.property_token)
+        self.assertTrue(all(value is None for value in hotel.details.model_dump().values()))
+        self.assertEqual(hotel.vibe_match_status, "not_verified")
+
+    def test_hotel_stars_are_not_inferred_from_rating_or_class_text(self):
+        for raw in (raw_hotel(rating=5), {**raw_hotel(), "hotel_class": "5-star hotel"}):
+            with self.subTest(raw=raw):
+                hotel = parse_hotel_offer(raw, self.query)
+                self.assertIsNone(hotel.details.stars)
+                self.assertEqual(hotel.rating, raw["overall_rating"])
+
+    def test_property_token_is_optional_opaque_text_not_an_api_url(self):
+        hotel = parse_hotel_offer({**raw_hotel(), "property_token": " opaque_-token== "}, self.query)
+        self.assertEqual(hotel.property_token, "opaque_-token==")
+        for value in (None, "", "  ", 123, [], {"token": "test"}):
+            with self.subTest(value=value):
+                hotel = parse_hotel_offer({**raw_hotel(), "property_token": value}, self.query)
+                self.assertIsNone(hotel.property_token)
+
+    def test_malformed_optional_details_do_not_discard_valid_price(self):
+        raw = {
+            **raw_hotel(), "type": 12, "description": {}, "address": [],
+            "hotel_class": False, "extracted_hotel_class": 6, "reviews": -1,
+            "gps_coordinates": {"latitude": 91, "longitude": 10},
+            "check_in_time": {}, "check_out_time": 11,
+            "amenities": "Pool", "excluded_amenities": {}, "essential_info": [None],
+            "images": [{"thumbnail": "not a URL"}],
+        }
+        hotel = parse_hotel_offer(raw, self.query)
+        self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
+        self.assertTrue(all(value is None for value in hotel.details.model_dump().values()))
+
+    def test_optional_integer_fields_do_not_coerce_booleans_or_strings(self):
+        for value in (True, "4", 4.5, {}, None):
+            with self.subTest(value=value):
+                hotel = parse_hotel_offer({**raw_hotel(), "extracted_hotel_class": value, "reviews": value}, self.query)
+                self.assertIsNone(hotel.details.stars)
+                self.assertIsNone(hotel.details.reviews)
+        hotel = parse_hotel_offer({**raw_hotel(), "reviews": 0, "extracted_hotel_class": 1}, self.query)
+        self.assertEqual(hotel.details.reviews, 0)
+        self.assertEqual(hotel.details.stars, 1)
+
+    def test_invalid_or_partial_coordinates_are_omitted(self):
+        for value in (
+            None, [], {"latitude": 10}, {"latitude": 10, "longitude": 181},
+            {"latitude": True, "longitude": 10}, {"latitude": float("nan"), "longitude": 10},
+            {"latitude": 10, "longitude": float("inf")},
+        ):
+            with self.subTest(value=value):
+                hotel = parse_hotel_offer({**raw_hotel(), "gps_coordinates": value}, self.query)
+                self.assertIsNone(hotel.details.gps_coordinates)
+
+    def test_optional_lists_keep_valid_items_without_mutating_response(self):
+        raw = {
+            **detailed_raw_hotel(), "amenities": [" Free Wi-Fi ", None, {}, "", "Pool"],
+            "excluded_amenities": [], "essential_info": [False, "Private room"],
+        }
+        before = deepcopy(raw)
+        hotel = parse_hotel_offer(raw, self.query)
+        self.assertEqual(hotel.details.amenities, ["Free Wi-Fi", "Pool"])
+        self.assertEqual(hotel.details.excluded_amenities, [])
+        self.assertEqual(hotel.details.essential_info, ["Private room"])
+        self.assertEqual(raw, before)
+        hotel.details.amenities.append("Test change")
+        self.assertEqual(raw, before)
+
+    def test_missing_empty_and_invalid_detail_lists_remain_distinguishable(self):
+        for key in ("amenities", "excluded_amenities", "essential_info", "images"):
+            for value, expected in ((None, None), ([], []), ([None, {}], None)):
+                with self.subTest(key=key, value=value):
+                    hotel = parse_hotel_offer({**raw_hotel(), key: value}, self.query)
+                    self.assertEqual(getattr(hotel.details, key), expected)
+
+    def test_photo_urls_are_validated_without_fetching_them(self):
+        raw = {**raw_hotel(), "images": [
+            {"thumbnail": "https://images.example/good.jpg", "original_image": "javascript:alert(1)"},
+            {"original_image": "https://images.example/original.jpg"},
+            {"thumbnail": "https://serpapi.com/search.json?api_key=secret"},
+            {"original_image": "https://user:password@images.example/photo.jpg"},
+            {"original_image": "https://images.example/photo.jpg?API_KEY=secret"},
+            {"thumbnail": "https://www.google.com/_/TravelFrontendUi/data/batchexecute"},
+            None,
+        ]}
+        hotel = parse_hotel_offer(raw, self.query)
+        self.assertEqual(len(hotel.details.images), 2)
+        self.assertIsNone(hotel.details.images[0].original_image)
+        self.assertIsNone(hotel.details.images[1].thumbnail)
+        self.assertNotIn("secret", hotel.model_dump_json())
+        self.api.assert_not_called()
+
+    def test_vibe_is_not_verified_from_descriptions_coordinates_or_provider_flags(self):
+        hotel = parse_hotel_offer({
+            **detailed_raw_hotel(), "name": "Beachfront Hotel", "description": "Near a beach",
+            "amenities": ["Beach access"], "vibe_match_status": "verified",
+        }, self.query)
+        self.assertEqual(hotel.vibe_match_status, "not_verified")
+        with self.assertRaises(ValidationError):
+            HotelOffer.model_validate({**hotel.model_dump(), "vibe_match_status": "verified"})
+
+    def test_unknown_private_provider_fields_are_not_exported(self):
+        hotel = parse_hotel_offer({
+            **detailed_raw_hotel(), "api_key": "secret-key",
+            "serpapi_property_details_link": "https://serpapi.com/search.json?api_key=secret-key",
+            "search_metadata": {"json_endpoint": "private-search-url"},
+            "gps_coordinates": {"latitude": 10, "longitude": 20, "api_key": "nested-secret"},
+        }, self.query)
+        encoded = hotel.model_dump_json()
+        for value in ("secret-key", "nested-secret", "private-search-url", "serpapi_property_details_link"):
+            self.assertNotIn(value, encoded)
+        self.assertEqual(hotel.property_token, "test-property-token")
+
+    def test_public_google_hotels_link_is_distinct_from_property_link(self):
+        self.api.return_value = {
+            "search_metadata": {"google_hotels_url": "https://www.google.com/travel/hotels?q=Lisbon"},
+            "properties": [detailed_raw_hotel()],
+        }
+        hotel = search_hotels(self.query)[0]
+        self.assertEqual(hotel.search_redirect.kind, "hotel_search")
+        self.assertEqual(hotel.search_redirect.label, "Apri la ricerca hotel")
+        self.assertEqual(str(hotel.search_redirect.url), "https://www.google.com/travel/hotels?q=Lisbon")
+        self.assertEqual(str(hotel.redirect.url), "https://hotel.example/stay")
+        self.api.assert_called_once()
+
+    def test_missing_property_link_does_not_promote_api_link_or_other_rate_link(self):
+        self.api.return_value = {
+            "search_metadata": {"google_hotels_url": "https://www.google.com/travel/search?q=Lisbon"},
+            "properties": [{
+                **detailed_raw_hotel(), "link": None,
+                "prices": [{"link": "https://booking.example/other-rate", "total_rate": {"extracted_lowest": 1000}}],
+            }],
+        }
+        hotel = search_hotels(self.query)[0]
+        self.assertIsNone(hotel.redirect)
+        self.assertEqual(hotel.search_redirect.kind, "hotel_search")
+        self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
+
+    def test_missing_or_malformed_search_metadata_does_not_discard_offer(self):
+        for metadata in (None, [], "invalid", {}, {"google_hotels_url": "https://serpapi.com/search"}):
+            with self.subTest(metadata=metadata):
+                self.api.return_value = {"search_metadata": metadata, "properties": [raw_hotel()]}
+                hotel = search_hotels(self.query)[0]
+                self.assertIsNone(hotel.search_redirect)
+                self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
+
+    def test_enrichment_does_not_change_local_budget_filter(self):
+        self.api.return_value = {"properties": [detailed_raw_hotel(total="250"), detailed_raw_hotel(total="250.01")]}
+        offers = search_hotels(self.query.model_copy(update={"max_total_price_eur": 250}))
+        self.assertEqual(len(offers), 1)
+        self.assertEqual(offers[0].total_price_eur, Decimal("250"))
+        self.assertEqual(offers[0].details.stars, 4)
 
 
 class RecordedHotelFixtureTest(unittest.TestCase):
@@ -211,6 +426,10 @@ class RecordedHotelFixtureTest(unittest.TestCase):
                         nightly = (raw.get("rate_per_night") or {}).get("extracted_lowest")
                         self.assertEqual(offer.nightly_price_eur, Decimal(str(nightly)) if nightly is not None else None)
                         self.assertIsNone(offer.redirect)
+                        self.assertIsNone(offer.property_token)
+                        self.assertIsNone(offer.details.amenities)
+                        self.assertIsNone(offer.details.stars)
+                        self.assertEqual(offer.vibe_match_status, "not_verified")
 
 
 class RedirectTest(unittest.TestCase):
@@ -218,6 +437,7 @@ class RedirectTest(unittest.TestCase):
         for url in (
             None, 4, {}, "not a URL", "javascript:alert(1)", "file:///tmp/example",
             "https://serpapi.com/search.json", "https://api.serpapi.com/search",
+            "https://serpapi.com./search.json", "https://api.serpapi.com./search",
             "https://user:password@hotel.example", "https://hotel.example?api_key=secret",
             "https://www.google.com/_/TravelFrontendUi/data/batchexecute",
         ):
@@ -230,9 +450,36 @@ class RedirectTest(unittest.TestCase):
                 redirect = parse_redirect(url, kind="search")
                 self.assertEqual(redirect.kind, "search")
                 self.assertEqual(redirect.label, "Apri la ricerca voli")
-        for url in ("https://not-google.example/travel/flights", "https://www.google.com/", "https://www.google.com.evil.example/travel/flights"):
+        for url in (
+            "https://not-google.example/travel/flights", "https://www.google.com/",
+            "https://www.google.com.evil.example/travel/flights", "https://www.google.com/flights/unsupported",
+        ):
             with self.subTest(url=url):
                 self.assertIsNone(parse_redirect(url, kind="search"))
+
+    def test_hotel_search_link_requires_a_public_google_hotels_page(self):
+        for url in (
+            "https://www.google.com/travel/hotels?q=Lisbon",
+            "https://www.google.it/travel/search?q=Lisbon",
+            "https://www.google.co.uk/travel/hotels/entity/test",
+        ):
+            with self.subTest(url=url):
+                redirect = parse_redirect(url, kind="hotel_search")
+                self.assertEqual(redirect.kind, "hotel_search")
+                self.assertEqual(redirect.label, "Apri la ricerca hotel")
+                self.assertIsNone(parse_redirect(url, kind="search"))
+        for url in (
+            "https://www.google.com/travel/flights", "https://www.google.com/",
+            "https://not-google.example/travel/hotels", "https://www.google.com.evil.example/travel/hotels",
+            "https://www.google.com/travel/hotels-internal", "https://www.google.com/_/TravelFrontendUi/data/batchexecute",
+            "https://serpapi.com/search.json", "https://www.google.com/travel/hotels?api_key=secret",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(parse_redirect(url, kind="hotel_search"))
+
+    def test_property_link_label_does_not_promise_the_official_site_or_quoted_rate(self):
+        redirect = parse_redirect("https://travel-provider.example/hotel", kind="property_website")
+        self.assertEqual(redirect.label, "Apri la pagina dell'alloggio")
 
 
 if __name__ == "__main__":

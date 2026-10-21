@@ -11,7 +11,7 @@ class SearchLimits(BaseModel):
     max_periods_per_destination: int = Field(default=1, ge=1)
     max_outbound: int = Field(default=1, ge=1)
     max_serpapi_calls: int = Field(default=5, ge=0)
-    max_llm_calls: int = Field(default=1, ge=0)
+    max_llm_calls: int = Field(default=2, ge=0)
 
 
 class SearchLimitExceeded(RuntimeError):

@@ -37,7 +37,7 @@ class OpenRouterDiagnosticsTest(unittest.TestCase):
     def assert_response_error(self, response, kind, api_code=None):
         self.post.reset_mock(side_effect=True)
         self.post.return_value = response
-        budget = RunBudget(SearchLimits())
+        budget = RunBudget(SearchLimits(max_llm_calls=1))
         with self.assertRaises(OpenRouterError) as caught:
             call_openrouter_json(self.messages, {}, budget=budget)
         error = caught.exception
@@ -112,7 +112,7 @@ class OpenRouterDiagnosticsTest(unittest.TestCase):
                 self.post.reset_mock()
                 cause = exception(f"{SECRET_KEY} {SECRET_PROMPT}")
                 self.post.side_effect = cause
-                budget = RunBudget(SearchLimits())
+                budget = RunBudget(SearchLimits(max_llm_calls=1))
                 with self.assertRaises(OpenRouterError) as caught:
                     call_openrouter_json(self.messages, {}, budget=budget)
                 self.assertEqual(caught.exception.kind, kind)

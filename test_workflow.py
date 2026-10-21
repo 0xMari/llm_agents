@@ -17,9 +17,10 @@ from providers.flights import FlightLocationError, resolve_city
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
 from providers.hotels import parse_hotel_offer, search_hotels
 from test_flights import fake_city, fake_flight_search, make_flight, raw_leg
-from test_hotels import fake_hotel_search, raw_hotel
+from test_hotels import detailed_raw_hotel, fake_hotel_search, raw_hotel
+from test_proposal_summary import fake_summary_response
 
-from scoring import score_proposal, select_top_proposals
+from scoring import score_proposal, select_final_proposals
 from agents.destination_agent import suggest_destinations
 from agents.travel_window import evaluate_travel_window, resolve_month_year
 
@@ -76,12 +77,15 @@ class WorkflowTest(unittest.TestCase):
     def setUp(self):
         self.limits = SearchLimits(
             max_destinations=3, max_periods_per_destination=3,
-            max_outbound=3, max_serpapi_calls=50, max_llm_calls=4,
+            max_outbound=3, max_serpapi_calls=50, max_llm_calls=5,
         )
         self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("Live HTTP disabled")))
         self.fake_resolve_city = self.enterContext(patch("planning.resolve_city", side_effect=fake_city))
         self.fake_flight_search = self.enterContext(patch("planning.search_flights", side_effect=fake_flight_search))
         self.fake_hotel_search = self.enterContext(patch("planning.search_hotels", side_effect=fake_hotel_search))
+        self.fake_summary_call = self.enterContext(patch(
+            "agents.proposal_summary.call_openrouter_json", side_effect=fake_summary_response,
+        ))
         self.openrouter_patcher = patch("agents.travel_window.call_openrouter_json")
         self.fake_openrouter_call = self.openrouter_patcher.start()
         self.addCleanup(self.openrouter_patcher.stop)
@@ -196,7 +200,7 @@ class WorkflowTest(unittest.TestCase):
     #     )
 
 
-    def test_returns_at_most_three_proposals(self):
+    def test_returns_at_most_three_complete_proposals(self):
         request = TripRequest(
             origin = "Rome",
             destination_pref = DestinationPreference(
@@ -218,6 +222,150 @@ class WorkflowTest(unittest.TestCase):
 
         self.assertNotIsInstance(result, PlanningError)
         self.assertLessEqual(len(result.proposals), 3)
+
+    def test_selects_three_tradeoffs_from_all_combinations_without_extra_searches(self):
+        flights = [
+            make_flight(140, via=("MAD", "BCN")),
+            make_flight(150, via=("MAD",)),
+            make_flight(160),
+        ]
+        hotels = [
+            HotelOffer(destination="Lisbon", name=name, rating=rating, nights=5, total_price_eur=total)
+            for name, rating, total in (
+                ("First stay", 4.9, 300), ("Second stay", 4.5, 250),
+                ("Third stay", 4.0, 200), ("Fourth stay", 3.9, 150),
+            )
+        ]
+        with patch("planning.search_flights", return_value=flights) as flight_search, patch(
+            "planning.search_hotels", return_value=hotels,
+        ) as hotel_search:
+            result = self.build_proposal(self.flight_request())
+
+        self.assertNotIsInstance(result, PlanningError)
+        self.assertEqual([p.hotel.name for p in result.proposals], ["Fourth stay"] * 3)
+        self.assertEqual([p.total_price_eur for p in result.proposals], [290, 300, 310])
+        self.assertEqual([p.flight.stops for p in result.proposals], [2, 1, 0])
+        self.assertEqual([p.selection_profiles for p in result.proposals], [["cheapest"], ["balanced"], ["comfortable"]])
+        self.assertEqual([p.comparison.proposal_id for p in result.proposals], ["p1", "p2", "p3"])
+        self.assertEqual([p.comparison.reference_id for p in result.proposals], ["p1"] * 3)
+        self.assertEqual([p.comparison.extra_price_eur for p in result.proposals], [Decimal("0"), Decimal("10"), Decimal("20")])
+        self.assertEqual([p.comparison.stops_delta for p in result.proposals], [0, -1, -2])
+        self.assertEqual([p.comparison.duration_delta_minutes for p in result.proposals], [0, -180, -360])
+        self.assertEqual([p.comparison.early_departures_delta for p in result.proposals], [0, 0, 0])
+        details = result.trace.events[-1].details
+        self.assertEqual(details["selected_count"], 3)
+        self.assertNotIn("selected_group_count", details)
+        self.assertNotIn("selected_variant_count", details)
+        self.assertEqual(result.trace.events[-1].reason_code, ReasonCode.SELECTED_BY_TRADEOFF)
+        accepted = [event for event in result.trace.events if event.event_type == EventType.COMBINATION_ACCEPTED]
+        self.assertEqual(len(accepted), 12)
+        flight_search.assert_called_once()
+        hotel_search.assert_called_once()
+        self.fake_openrouter_call.assert_called_once()
+        self.fake_summary_call.assert_called_once()
+        self.assertEqual(result.summary_status, "generated")
+        self.assertEqual([p.summary.proposal_id for p in result.proposals], ["p1", "p2", "p3"])
+        summary_payload = json.loads(self.fake_summary_call.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(len(summary_payload["proposals"]), 3)
+
+    def test_travel_context_stays_with_each_destination_even_if_summary_fails(self):
+        destinations = [
+            SuggestedDestination(name="Lisbon", country="Portugal", reason="Food", match_score=90),
+            SuggestedDestination(name="Tokyo", country="Japan", reason="Museums", match_score=80),
+        ]
+        self.fake_destination_call.return_value = json.dumps({
+            "destinations": [d.model_dump(mode="json") for d in destinations],
+        })
+        advice_by_destination = {}
+        for destination, month in zip(destinations, (10, 11)):
+            advice = json.loads(fake_travel_window_response(rationale=f"Advice for {destination.name}"))
+            advice["warnings"] = [f"Warning for {destination.name}"]
+            advice["alternatives"] = [{
+                "start": f"2026-{month}-05", "end": f"2026-{month}-10",
+                "score": 80, "reason": f"Alternative for {destination.name}",
+            }]
+            advice_by_destination[destination.name] = advice
+
+        def flights(query, **kwargs):
+            flight = make_flight(100, via=("MAD",)) if query.destination == "Lisbon" else make_flight(200)
+            flight.destination = query.destination
+            if query.destination == "Tokyo":
+                flight.outbound.segments[-1].arrival_airport = "NRT"
+                flight.inbound.segments[0].departure_airport = "NRT"
+            return [flight]
+
+        self.fake_flight_search.side_effect = flights
+        self.fake_hotel_search.side_effect = lambda query, **kwargs: [HotelOffer(
+            destination=query.destination, name=f"Stay in {query.destination}", nights=5, total_price_eur=200,
+        )]
+        for summary_fails in (False, True):
+            with self.subTest(summary_fails=summary_fails):
+                self.fake_openrouter_call.side_effect = [json.dumps(advice_by_destination[d.name]) for d in destinations]
+                self.fake_flight_search.reset_mock()
+                self.fake_hotel_search.reset_mock()
+                self.fake_summary_call.reset_mock()
+                if summary_fails:
+                    self.fake_summary_call.side_effect = None
+                    self.fake_summary_call.return_value = "invalid JSON"
+                result = self.build_proposal(self.flight_request(destination_pref=DestinationPreference(mode="open")))
+                self.assertNotIsInstance(result, PlanningError)
+                self.assertEqual([p.destination.name for p in result.proposals], ["Lisbon", "Tokyo"])
+                self.assertEqual(result.summary_status, "unavailable" if summary_fails else "generated")
+                self.fake_summary_call.assert_called_once()
+                payload = json.loads(self.fake_summary_call.call_args.kwargs["messages"][1]["content"])
+                for proposal, item in zip(result.proposals, payload["proposals"]):
+                    expected = advice_by_destination[proposal.destination.name]
+                    context = proposal.travel_context.model_dump(mode="json")
+                    self.assertEqual(context["warnings"], expected["warnings"])
+                    self.assertEqual(context["rationale"], expected["rationale"])
+                    self.assertEqual(context["alternatives"], expected["alternatives"])
+                    self.assertEqual(context["alternatives_status"], "suggestions_only")
+                    self.assertEqual(item["travel_context"], context)
+                self.assertEqual(self.fake_flight_search.call_count, 2)
+                self.assertEqual(self.fake_hotel_search.call_count, 2)
+                for call in self.fake_flight_search.call_args_list:
+                    self.assertEqual(call.args[0].departure_date, date(2026, 9, 15))
+
+    def test_tradeoffs_respect_preferred_budget_and_never_exceed_ceiling(self):
+        flights = [
+            make_flight(100, via=("MAD", "BCN")),
+            make_flight(150, via=("MAD",)),
+            make_flight(220),
+            make_flight(221),
+        ]
+        hotel = HotelOffer(destination="Lisbon", name="Test stay", nights=5, total_price_eur=500)
+        for flexibility, candidates, expected_totals in (
+            (0, flights, [600]),
+            (20, flights, [600]),
+            (20, flights[1:], [650, 720]),
+        ):
+            with self.subTest(flexibility=flexibility, expected=expected_totals), patch("planning.search_flights", return_value=candidates), patch(
+                "planning.search_hotels", return_value=[hotel],
+            ):
+                request = self.flight_request(budget_eur=600, budget_flexibility_pct=flexibility)
+                result = self.build_proposal(request)
+                self.assertNotIsInstance(result, PlanningError)
+                self.assertEqual([p.total_price_eur for p in result.proposals], expected_totals)
+                self.assertEqual(result.trace.events[-1].details["selected_count"], len(expected_totals))
+                for proposal in result.proposals:
+                    self.assertLessEqual(proposal.total_price_eur, calculate_budget_ceiling(request))
+                    reason = ReasonCode.OVER_PREFERRED_BUDGET if proposal.total_price_eur > 600 else ReasonCode.WITHIN_BUDGET
+                    self.assertIn(reason, [comment.reason_code for comment in proposal.comments])
+                self.assertIn(ReasonCode.OVER_MAX_BUDGET, [event.reason_code for event in result.trace.events])
+
+    def test_terminal_selected_count_excludes_identical_duplicate_proposals(self):
+        flight = make_flight()
+        hotel = HotelOffer(destination="Lisbon", name="Test stay", nights=5, total_price_eur=500)
+        with patch("planning.search_flights", return_value=[flight, flight.model_copy(deep=True)]), patch(
+            "planning.search_hotels", return_value=[hotel],
+        ):
+            result = self.build_proposal(self.flight_request())
+        self.assertNotIsInstance(result, PlanningError)
+        self.assertEqual(len(result.proposals), 1)
+        self.assertEqual(result.proposals[0].selection_profiles, ["cheapest", "comfortable"])
+        self.assertEqual(result.trace.events[-1].details["selected_count"], 1)
+        accepted = [event for event in result.trace.events if event.event_type == EventType.COMBINATION_ACCEPTED]
+        self.assertEqual(len(accepted), 2)
 
     
     def test_exact_dates_use_user_dates(self):
@@ -979,7 +1127,7 @@ class WorkflowTest(unittest.TestCase):
                     self.assertEqual(failures[0].details["destination"], "Kyoto")
 
 
-    def test_proposals_are_sorted_by_score(self):
+    def test_proposals_are_ordered_by_profile_not_old_rating_score(self):
         request = TripRequest(
             origin="Rome",
             budget_eur=900,
@@ -991,12 +1139,10 @@ class WorkflowTest(unittest.TestCase):
 
         self.assertNotIsInstance(result, PlanningError)
 
-        scores = [
-            score_proposal(proposal, request)
-            for proposal in result.proposals
-        ]
-
-        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual([p.selection_profiles for p in result.proposals], [["cheapest"], ["comfortable"]])
+        self.assertEqual([p.total_price_eur for p in result.proposals], [445, 490])
+        self.assertEqual([p.flight.stops for p in result.proposals], [1, 0])
+        self.assertEqual([p.hotel.name for p in result.proposals], ["Simple Rooms", "Simple Rooms"])
 
 
     def test_scoring_distinguishes_preferred_and_absent_budget(self):
@@ -1028,20 +1174,20 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(budget=budget):
                 current_request = request.model_copy(update={"budget_eur": budget})
                 self.assertEqual(
-                    select_top_proposals([better_match, within_budget], current_request),
+                    sorted([better_match, within_budget], key=lambda p: score_proposal(p, current_request), reverse=True),
                     expected,
                 )
-                self.assertEqual(
-                    select_top_proposals([better_match, within_budget], current_request, limit=1),
-                    expected[:1],
-                )
+                selected = select_final_proposals([better_match, within_budget], current_request)
+                self.assertEqual(len(selected), 1)
+                self.assertEqual(selected[0].total_price_eur, 800)
+                self.assertEqual(selected[0].selection_profiles, ["cheapest", "comfortable"])
 
         cheaper_same_match = proposal_with(800, 95)
         no_budget = request.model_copy(update={"budget_eur": None})
-        self.assertEqual(
-            select_top_proposals([better_match, cheaper_same_match], no_budget),
-            [cheaper_same_match, better_match],
-        )
+        selected = select_final_proposals([better_match, cheaper_same_match], no_budget)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].total_price_eur, 800)
+        self.assertEqual(selected[0].destination.match_score, 95)
 
 
     def test_workflow_prioritizes_proposals_within_preferred_budget(self):
@@ -1056,9 +1202,13 @@ class WorkflowTest(unittest.TestCase):
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(
             [proposal.total_price_eur <= request.budget_eur for proposal in result.proposals],
-            [True, True, False],
+            [True, True],
         )
-        self.assertLess(result.proposals[0].hotel.rating, result.proposals[-1].hotel.rating)
+        self.assertEqual(
+            [proposal.total_price_eur for proposal in result.proposals],
+            [445, 490],
+        )
+        self.assertIn(ReasonCode.OVER_PREFERRED_BUDGET, [event.reason_code for event in result.trace.events])
     
 
     def test_travel_window_exact_dates_uses_user_dates(self):
@@ -1533,7 +1683,10 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(api.call_args_list[2].args[0]["departure_id"], "/m/test_rome")
         self.assertEqual(api.call_args_list[2].args[0]["arrival_id"], "/m/test_lisbon")
         self.assertEqual(result.proposals[0].flight.price_eur, Decimal("249.99"))
-        self.assertEqual(result.proposals[0].total_price_eur, Decimal("724.99"))
+        self.assertEqual(result.proposals[0].hotel.name, "Simple Rooms")
+        self.assertEqual(result.proposals[0].hotel.total_price_eur, Decimal("310"))
+        self.assertEqual(result.proposals[0].total_price_eur, Decimal("559.99"))
+        self.assertEqual(result.proposals[0].selection_profiles, ["cheapest", "comfortable"])
 
     def test_airports_only_restrict_queries_when_explicit(self):
         result = self.build_proposal(self.flight_request(
@@ -1590,7 +1743,7 @@ class WorkflowTest(unittest.TestCase):
         flight = make_flight()
         flight.outbound.segments[-1].arrival_local += timedelta(days=1)
         self.fake_flight_search.side_effect = None
-        self.fake_flight_search.return_value = [flight, flight.model_copy(update={"price_eur": 200})]
+        self.fake_flight_search.return_value = [flight, flight.model_copy(update={"price_eur": Decimal("200")})]
         with patch("planning.search_hotels", wraps=fake_hotel_search) as hotels:
             result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
@@ -1681,10 +1834,17 @@ class WorkflowTest(unittest.TestCase):
         ]
         result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
-        self.assertEqual([proposal.hotel.name for proposal in result.proposals], ["Rated", "Unrated"])
-        self.assertIsNone(result.proposals[-1].hotel.rating)
+        self.assertEqual([proposal.hotel.name for proposal in result.proposals], ["Rated"])
+        self.assertEqual(result.proposals[0].hotel.rating, 0.0)
         for proposal in result.proposals:
             self.assertNotIn(ReasonCode.GOOD_HOTEL_RATING, [comment.reason_code for comment in proposal.comments])
+
+        self.fake_hotel_search.return_value = [self.fake_hotel_search.return_value[0]]
+        result = self.build_proposal(self.flight_request())
+        self.assertNotIsInstance(result, PlanningError)
+        self.assertEqual(len(result.proposals), 1)
+        self.assertIsNone(result.proposals[0].hotel.rating)
+        self.assertNotIn(ReasonCode.GOOD_HOTEL_RATING, [comment.reason_code for comment in result.proposals[0].comments])
 
     def test_hotel_provider_errors_keep_context_and_stop_planning(self):
         for error, reason in (
@@ -1772,7 +1932,7 @@ class WorkflowTest(unittest.TestCase):
             {"suggestions": [fake_city("Lisbon, Portugal")]},
             {"best_flights": [outbound]},
             {"other_flights": [raw_leg("LIS", "FCO", date(2026, 9, 20), price="249.99")]},
-            {"properties": [raw_hotel(total="249.99", nightly="62.50")]},
+            {"properties": [detailed_raw_hotel(total="249.99", nightly="62.50")]},
         ]
         responses = []
         for payload in payloads:
@@ -1797,6 +1957,13 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(proposal.hotel.nights, 4)
         self.assertEqual(proposal.flight.redirect.kind, "search")
         self.assertEqual(proposal.hotel.redirect.kind, "property_website")
+        self.assertEqual(proposal.hotel.property_token, "test-property-token")
+        self.assertEqual(proposal.hotel.details.stars, 4)
+        self.assertEqual(proposal.hotel.details.amenities, ["Free Wi-Fi", "Pool"])
+        self.assertEqual(proposal.hotel.vibe_match_status, "not_verified")
+        self.assertEqual(str(proposal.hotel.details.images[0].thumbnail), "https://images.example/thumbnail.jpg")
+        self.assertEqual(proposal.comparison.extra_price_eur, 0)
+        self.fake_openrouter_call.assert_called_once()
         params = get.call_args_list[-1].kwargs["params"]
         self.assertEqual(params["q"], "Hotels in Lisbon, Portugal")
         self.assertEqual(params["check_in_date"], "2026-09-16")

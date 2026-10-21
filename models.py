@@ -127,6 +127,14 @@ class TravelWindowAdvice(BaseModel):
     rationale: str | None = None
 
 
+class ProposalTravelContext(BaseModel):
+    warnings: list[str] = Field(default_factory=list)
+    rationale: str | None = None
+    alternatives: list[SuggestedTimePeriod] = Field(default_factory=list)
+    # These are LLM suggestions, not additional flight + hotel quotes.
+    alternatives_status: Literal["suggestions_only"] = "suggestions_only"
+
+
 class SuggestedStayLength(BaseModel):
     nights: int = Field(ge=1)
     reason: str
@@ -167,7 +175,7 @@ class FlightLeg(BaseModel):
 
 class OfferRedirect(BaseModel):
     url: HttpUrl
-    kind: Literal["search", "property_website"]
+    kind: Literal["search", "property_website", "hotel_search"]
     label: str
 
 
@@ -217,10 +225,42 @@ class Hotel(BaseModel):
     nightly_price_eur: Decimal | None = Field(default=None, ge=0)
     rating: float | None = Field(default=None, ge=0, le=5)
 
+
+class HotelCoordinates(BaseModel):
+    latitude: float = Field(ge=-90, le=90, strict=True, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, strict=True, allow_inf_nan=False)
+
+
+class HotelImage(BaseModel):
+    thumbnail: HttpUrl | None = None
+    original_image: HttpUrl | None = None
+
+
+class HotelDetails(BaseModel):
+    property_type: str | None = None
+    description: str | None = None
+    address: str | None = None
+    hotel_class: str | None = None
+    stars: int | None = Field(default=None, ge=1, le=5, strict=True)
+    reviews: int | None = Field(default=None, ge=0, strict=True)
+    gps_coordinates: HotelCoordinates | None = None
+    check_in_time: str | None = None
+    check_out_time: str | None = None
+    amenities: list[str] | None = None
+    excluded_amenities: list[str] | None = None
+    essential_info: list[str] | None = None
+    images: list[HotelImage] | None = None
+
+
 class HotelOffer(Hotel):
     nights: int = Field(ge=1)
     total_price_eur: Decimal = Field(ge=0)
     redirect: OfferRedirect | None = None
+    search_redirect: OfferRedirect | None = None
+    property_token: str | None = Field(default=None, min_length=1)
+    details: HotelDetails = Field(default_factory=HotelDetails)
+    # Provider descriptions and coordinates do not verify the user's requirements.
+    vibe_match_status: Literal["not_verified"] = "not_verified"
 
 
 class EventType(StrEnum):
@@ -233,6 +273,8 @@ class EventType(StrEnum):
     COMBINATION_ACCEPTED = "COMBINATION_ACCEPTED"
     COMBINATION_EXCLUDED = "COMBINATION_EXCLUDED"
     PROPOSALS_SELECTED = "PROPOSALS_SELECTED"
+    PROPOSAL_SUMMARY_GENERATED = "PROPOSAL_SUMMARY_GENERATED"
+    PROPOSAL_SUMMARY_FAILED = "PROPOSAL_SUMMARY_FAILED"
     SEARCH_FAILED = "SEARCH_FAILED"
     TRAVEL_WINDOW_FAILED = "TRAVEL_WINDOW_FAILED"
 
@@ -259,7 +301,8 @@ class ReasonCode(StrEnum):
     OVER_MAX_BUDGET = "OVER_MAX_BUDGET"
     DIRECT_FLIGHT = "DIRECT_FLIGHT"
     GOOD_HOTEL_RATING = "GOOD_HOTEL_RATING"
-    RANKED_BY_SCORE_RATING_PRICE = "RANKED_BY_SCORE_RATING_PRICE"
+    SELECTED_BY_TRADEOFF = "SELECTED_BY_TRADEOFF"
+    PROPOSAL_SUMMARY_GENERATED = "PROPOSAL_SUMMARY_GENERATED"
     NO_AFFORDABLE_PROPOSAL = "NO_AFFORDABLE_PROPOSAL"
     LLM_PROVIDER_ERROR = "LLM_PROVIDER_ERROR"
     LLM_OUTPUT_INVALID = "LLM_OUTPUT_INVALID"
@@ -283,6 +326,30 @@ class DecisionTrace(BaseModel):
     events: list[DecisionEvent] = Field(default_factory=list)
 
 
+class ProposalComparison(BaseModel):
+    proposal_id: str
+    reference_id: str
+    extra_price_eur: Decimal = Field(ge=0)
+    stops_delta: int
+    duration_delta_minutes: int
+    early_departures_delta: int
+
+
+class ProposalSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    proposal_id: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=80)
+    advantage: str = Field(min_length=1, max_length=250)
+    tradeoff: str | None = Field(min_length=1, max_length=250)
+
+
+class ProposalSummaries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ProposalSummary] = Field(min_length=1, max_length=3)
+
+
 class TripProposal(BaseModel):
     destination: SuggestedDestination
     period: SuggestedTimePeriod
@@ -291,11 +358,18 @@ class TripProposal(BaseModel):
     total_price_eur: Decimal = Field(ge=0)
     recommendations: list[str]
     comments: list[ProposalComment] = Field(default_factory=list)
+    selection_profiles: list[
+        Literal["cheapest", "comfortable", "balanced"]
+    ] = Field(default_factory=list)
+    comparison: ProposalComparison | None = None
+    summary: ProposalSummary | None = None
+    travel_context: ProposalTravelContext | None = None
 
-#numero di risultati
+
 class TripSearchResult(BaseModel):
     proposals: list[TripProposal] = Field(min_length=1, max_length=3)
     trace: DecisionTrace
+    summary_status: Literal["not_requested", "generated", "unavailable"] = "not_requested"
 
 
 class PlanningError(BaseModel):
