@@ -50,7 +50,7 @@ def make_flight(price=180, *, start=date(2026, 9, 15), end=date(2026, 9, 20), vi
     )
 
 
-def fake_city(text, *, city_id=None):
+def fake_city(text, *, city_id=None, budget=None):
     name = text.split(",")[0]
     codes = {"Rome": ["FCO", "CIA"], "Lisbon": ["LIS"], "Milan": ["MXP", "LIN"]}.get(name, ["NRT"])
     return {
@@ -65,7 +65,7 @@ def recorded_rome_autocomplete():
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def fake_flight_search(query):
+def fake_flight_search(query, *, max_outbound=3, budget=None):
     if (query.origin, query.destination) != ("Rome", "Lisbon"):
         return []
     prices = {

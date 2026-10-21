@@ -81,12 +81,12 @@ def record_hotels(output: Path, demo_args: list[str]) -> int:
     calls = 0
     captured = False
 
-    def recording_search(params):
+    def recording_search(params, *, budget=None):
         nonlocal calls, captured
         if calls >= MAX_CALLS:
             raise FixtureRecordingError("Limite di cinque chiamate raggiunto: ricerca interrotta.")
         calls += 1
-        response = live_search(params)
+        response = live_search(params, budget=budget)
         if params.get("engine") == "google_hotels":
             fixture = build_hotel_fixture(params, response)
             try:

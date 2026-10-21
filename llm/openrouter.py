@@ -3,6 +3,8 @@
 import os
 import requests
 
+from execution import RunBudget
+
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -15,6 +17,8 @@ def call_openrouter_json(
     messages: list[dict[str, str]],
     response_schema: dict,
     schema_name: str = "travel_window_advice",
+    *,
+    budget: RunBudget | None = None,
 ) -> str:
     api_key = os.getenv("OPENROUTER_API_KEY")
     model = os.getenv("OPENROUTER_MODEL")
@@ -25,6 +29,8 @@ def call_openrouter_json(
     if not model:
         raise OpenRouterError("OPENROUTER_MODEL non configurato.")
 
+    if budget is not None:
+        budget.claim("llm")
     try:
         response = requests.post(
             OPENROUTER_URL,

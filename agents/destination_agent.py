@@ -3,6 +3,7 @@ import json
 from datetime import date
 from agents.travel_window import build_time_context
 from llm.openrouter import call_openrouter_json
+from execution import RunBudget
 
 
 SYSTEM_PROMPT = (
@@ -23,7 +24,7 @@ SYSTEM_PROMPT = (
     "Restituisci solo il JSON previsto dallo schema."
 )
 
-def suggest_destinations(request: TripRequest) -> list[SuggestedDestination]:
+def suggest_destinations(request: TripRequest, *, budget: RunBudget | None = None) -> list[SuggestedDestination]:
     payload = request.model_dump(mode="json")
     payload["time_context"] = build_time_context(request, date.today())
     raw_json = call_openrouter_json(
@@ -33,6 +34,7 @@ def suggest_destinations(request: TripRequest) -> list[SuggestedDestination]:
         ],
         response_schema=DestinationAdvice.model_json_schema(),
         schema_name="destination_advice",
+        budget=budget,
     )
     advice = DestinationAdvice.model_validate_json(raw_json)
     return [SuggestedDestination(**d.model_dump()) for d in advice.destinations]

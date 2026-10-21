@@ -1,5 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
+from execution import RunBudget
+
 from models import HotelOffer, HotelSearchQuery
 from providers.links import parse_redirect
 from providers.serpapi_client import SerpAPIResponseError, search as search_serpapi
@@ -29,7 +31,7 @@ def parse_hotel_offer(raw_hotel: dict, query: HotelSearchQuery) -> HotelOffer:
         raise SerpAPIResponseError("Prezzi o dati dell'offerta hotel non validi.") from None
 
 
-def search_hotels(query: HotelSearchQuery) -> list[HotelOffer]:
+def search_hotels(query: HotelSearchQuery, *, budget: RunBudget | None = None) -> list[HotelOffer]:
     query.validate_stay_dates()
     response = search_serpapi({
         "engine": "google_hotels",
@@ -38,7 +40,7 @@ def search_hotels(query: HotelSearchQuery) -> list[HotelOffer]:
         "check_out_date": query.checkout_date.isoformat(),
         "adults": query.adults,
         "currency": "EUR", "hl": "it", "gl": "it",
-    })
+    }, budget=budget)
     offers = [parse_hotel_offer(item, query) for item in _hotel_results(response)]
     if query.max_total_price_eur is not None:
         offers = [offer for offer in offers if offer.total_price_eur <= query.max_total_price_eur]

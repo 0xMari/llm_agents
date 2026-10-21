@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+from execution import RunBudget, SearchLimitExceeded, SearchLimits
+
 from agents.activities import suggest_activities
 from agents.destination_agent import suggest_destinations
 
@@ -30,7 +32,7 @@ from llm.openrouter import OpenRouterError
 from agents.travel_window import TravelWindowConstraintError
 
 
-def resolve_destinations(request: TripRequest) -> list[SuggestedDestination]:
+def resolve_destinations(request: TripRequest, *, budget: RunBudget) -> list[SuggestedDestination]:
     if request.destination_pref.mode == "fixed":
         return [
             SuggestedDestination(
@@ -40,7 +42,7 @@ def resolve_destinations(request: TripRequest) -> list[SuggestedDestination]:
             )
         ]
 
-    return suggest_destinations(request)
+    return suggest_destinations(request, budget=budget)
 
 
 def calculate_budget_ceiling(request: TripRequest) -> Decimal | None:
@@ -96,10 +98,57 @@ def hotel_search_failure(events: list[DecisionEvent], query: HotelSearchQuery, e
     return PlanningError(code=reason.value, message=message, trace=DecisionTrace(events=events))
 
 
-def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
+def build_proposal(request: TripRequest, *, limits: SearchLimits) -> TripSearchResult | PlanningError:
+    budget = RunBudget(limits)
+    events = []
+    try:
+        result = _build_proposal(request, budget=budget, events=events)
+    except SearchLimitExceeded as error:
+        message = "Ricerca interrotta: raggiunto il limite di chiamate configurato."
+        events.append(DecisionEvent(
+            event_type=EventType.SEARCH_FAILED,
+            reason_code=ReasonCode.SEARCH_LIMIT_REACHED,
+            details={"service": error.service, "used": error.used, "limit": error.limit},
+            comment=message,
+        ))
+        result = PlanningError(
+            code=ReasonCode.SEARCH_LIMIT_REACHED.value,
+            message=message,
+            trace=DecisionTrace(events=events),
+        )
+
+    # Keep the terminal decision last, with a summary of attempted HTTP calls.
+    result.trace.events[-1].details.update(
+        serpapi_calls=budget.used["serpapi"],
+        llm_calls=budget.used["llm"],
+        **limits.model_dump(),
+    )
+    return result
+
+
+def record_scope_reduction(
+    events: list[DecisionEvent], *, scope: str, available: int,
+    unique: int, selected: int, destination: str | None = None,
+) -> None:
+    if selected == available:
+        return
+    events.append(DecisionEvent(
+        event_type=EventType.SEARCH_SCOPE_REDUCED,
+        reason_code=ReasonCode.SEARCH_SCOPE_REDUCED,
+        details={
+            "scope": scope, "available_count": available, "unique_count": unique,
+            "selected_count": selected, "destination": destination,
+        },
+        comment="Ricerca ridotta dopo ordinamento, deduplicazione e applicazione dei limiti.",
+    ))
+
+
+def _build_proposal(
+    request: TripRequest, *, budget: RunBudget, events: list[DecisionEvent],
+) -> TripSearchResult | PlanningError:
+    limits = budget.limits
     scenario = route_request(request)
     proposals = []
-    events = []
     found_flights = False
     found_combinations = False
     budget_ceiling = calculate_budget_ceiling(request)
@@ -116,7 +165,7 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
     )
 
     try:
-        destinations = resolve_destinations(request)
+        destinations = resolve_destinations(request, budget=budget)
     except (OpenRouterError, ValidationError) as exc:
         if isinstance(exc, OpenRouterError):
             reason = ReasonCode.LLM_PROVIDER_ERROR
@@ -138,6 +187,13 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
             trace=DecisionTrace(events=events),
         )
 
+    candidates = destinations
+    destinations = sorted(candidates, key=lambda item: item.match_score, reverse=True)[:limits.max_destinations]
+    record_scope_reduction(
+        events, scope="destinations", available=len(candidates),
+        unique=len(candidates), selected=len(destinations),
+    )
+
     events.append(
         DecisionEvent(
             event_type=EventType.DESTINATIONS_RESOLVED,
@@ -156,7 +212,7 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
     
     for destination in destinations:
         try:
-            window_advice = evaluate_travel_window(request, destination)
+            window_advice = evaluate_travel_window(request, destination, budget=budget)
         except (OpenRouterError, ValidationError, TravelWindowConstraintError) as exc:
             if isinstance(exc, OpenRouterError):
                 reason = ReasonCode.LLM_PROVIDER_ERROR
@@ -177,6 +233,15 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                 trace=DecisionTrace(events=events),
             )
 
+        unique_periods = {}
+        for period in sorted(window_advice.selected_periods, key=lambda item: item.score, reverse=True):
+            unique_periods.setdefault((period.start, period.end), period)
+        periods = list(unique_periods.values())[:limits.max_periods_per_destination]
+        record_scope_reduction(
+            events, scope="periods", available=len(window_advice.selected_periods),
+            unique=len(unique_periods), selected=len(periods), destination=destination.name,
+        )
+
         events.append(
             DecisionEvent(
                 event_type=EventType.TRAVEL_WINDOW_EVALUATED,
@@ -185,15 +250,13 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                     "destination": destination.name,
                     "selected_periods": [
                         f"{period.start.isoformat()}->{period.end.isoformat()}"
-                        for period in window_advice.selected_periods
+                        for period in periods
                     ],
                     "warnings": window_advice.warnings,
                 },
                 comment=window_advice.rationale,
             )
         )
-
-        periods = window_advice.selected_periods
 
         destination_text = ", ".join(filter(None, [destination.name, destination.country]))
         locations = [
@@ -205,7 +268,7 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
             for text, city_id, airport_code in locations:
                 key = (text, city_id)
                 if key not in city_cache:
-                    city_cache[key] = resolve_city(text, city_id=city_id)
+                    city_cache[key] = resolve_city(text, city_id=city_id, budget=budget)
                 search_ids.append(search_id_for(city_cache[key], airport_code))
         except (SerpAPIError, FlightLocationError) as error:
             return flight_search_failure(events, destination.name, error)
@@ -237,7 +300,7 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
             )
 
             try:
-                flights = search_flights(flight_query)
+                flights = search_flights(flight_query, max_outbound=limits.max_outbound, budget=budget)
             except SerpAPIError as error:
                 return flight_search_failure(events, destination.name, error)
 
@@ -279,7 +342,7 @@ def build_proposal(request: TripRequest) -> TripSearchResult | PlanningError:
                 stay_key = (hotel_query.location_name, checkin, checkout, hotel_query.adults)
                 if stay_key not in hotel_cache:
                     try:
-                        hotel_cache[stay_key] = search_hotels(hotel_query)
+                        hotel_cache[stay_key] = search_hotels(hotel_query, budget=budget)
                     except SerpAPIError as error:
                         return hotel_search_failure(events, hotel_query, error)
                 hotels = hotel_cache[stay_key]

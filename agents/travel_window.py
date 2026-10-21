@@ -4,6 +4,7 @@ from datetime import date
 from models import SuggestedDestination, TravelWindowAdvice, TripRequest
 
 from llm.openrouter import call_openrouter_json
+from execution import RunBudget
 
 TRAVEL_WINDOW_ADVICE_SCHEMA = {
     "type": "object",
@@ -172,6 +173,8 @@ def evaluate_travel_window(
     request: TripRequest,
     destination: SuggestedDestination,
     reference_date: date | None = None,
+    *,
+    budget: RunBudget | None = None,
 ) -> TravelWindowAdvice:
     resolved_reference_date = reference_date or date.today()
 
@@ -193,6 +196,7 @@ def evaluate_travel_window(
     raw_json = call_openrouter_json(
         messages=messages,
         response_schema=TRAVEL_WINDOW_ADVICE_SCHEMA,
+        budget=budget,
     )
 
     advice = TravelWindowAdvice.model_validate_json(raw_json)

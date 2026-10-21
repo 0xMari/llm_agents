@@ -1,6 +1,8 @@
 from decimal import Decimal, InvalidOperation
 import re
 
+from execution import RunBudget
+
 from models import (
     AIRPORT_CODE_PATTERN,
     CITY_ID_PATTERN,
@@ -53,7 +55,7 @@ def _validate_city(city: dict) -> None:
         raise SerpAPIResponseError("Elenco degli aeroporti non valido.")
 
 
-def find_city_options(text: str) -> list[dict]:
+def find_city_options(text: str, *, budget: RunBudget | None = None) -> list[dict]:
     if not text.strip():
         raise FlightLocationError("Specifica una citta da cercare.")
     response = search_serpapi({
@@ -62,7 +64,7 @@ def find_city_options(text: str) -> list[dict]:
         "exclude_regions": True,
         "hl": "en",
         "gl": "it",
-    })
+    }, budget=budget)
     cities = {}
     for item in _result_items(response, "suggestions"):
         # Autocomplete can include untyped airports even with exclude_regions.
@@ -73,8 +75,8 @@ def find_city_options(text: str) -> list[dict]:
     return list(cities.values())
 
 
-def resolve_city(text: str, *, city_id: str | None = None) -> dict:
-    cities = find_city_options(text)
+def resolve_city(text: str, *, city_id: str | None = None, budget: RunBudget | None = None) -> dict:
+    cities = find_city_options(text, budget=budget)
     normalized = " ".join(text.casefold().split())
     if city_id is not None:
         matches = [city for city in cities if city["id"] == city_id]
@@ -153,7 +155,9 @@ def _select_outbounds(items: list[dict], query: FlightSearchQuery, limit: int) -
     return (first_routes + remaining)[:limit]
 
 
-def search_flights(query: FlightSearchQuery, *, max_outbound: int = 3) -> list[FlightOffer]:
+def search_flights(
+    query: FlightSearchQuery, *, max_outbound: int = 3, budget: RunBudget | None = None,
+) -> list[FlightOffer]:
     if type(max_outbound) is not int or max_outbound < 1:
         raise ValueError("max_outbound deve essere un intero positivo.")
     params = {
@@ -163,7 +167,7 @@ def search_flights(query: FlightSearchQuery, *, max_outbound: int = 3) -> list[F
         "outbound_date": query.departure_date.isoformat(),
         "return_date": query.return_date.isoformat(),
     }
-    response = search_serpapi(params)
+    response = search_serpapi(params, budget=budget)
     metadata = response.get("search_metadata")
     redirect = parse_redirect(
         metadata.get("google_flights_url") if isinstance(metadata, dict) else None,
@@ -172,7 +176,7 @@ def search_flights(query: FlightSearchQuery, *, max_outbound: int = 3) -> list[F
     items = _result_items(response, "best_flights", "other_flights")
     offers = []
     for token, outbound in _select_outbounds(items, query, max_outbound):
-        returns = search_serpapi({**params, "departure_token": token})
+        returns = search_serpapi({**params, "departure_token": token}, budget=budget)
         for raw_inbound in _result_items(returns, "best_flights", "other_flights"):
             inbound = parse_flight_leg(raw_inbound)
             _validate_leg(inbound, query, returning=True)

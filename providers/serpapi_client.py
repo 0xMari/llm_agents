@@ -1,6 +1,8 @@
 import os
 import requests
 
+from execution import RunBudget
+
 
 class SerpAPIError(RuntimeError):
     code = "PROVIDER_ERROR"
@@ -15,10 +17,12 @@ class SerpAPIResponseError(SerpAPIError):
     code = "INVALID_RESPONSE"
 
 
-def search(params):
+def search(params, *, budget: RunBudget | None = None):
     api_key = os.environ.get("SERPAPI_API_KEY")
     if not api_key:
         raise SerpAPIError("Configura SERPAPI_API_KEY prima di eseguire la ricerca.", code="CONFIGURATION")
+    if budget is not None:
+        budget.claim("serpapi")
     try:
         response = requests.get(
             "https://serpapi.com/search.json",

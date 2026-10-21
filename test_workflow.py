@@ -1,11 +1,12 @@
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import json
 
 from requests.exceptions import Timeout
 from llm.openrouter import OpenRouterError, call_openrouter_json
 from planning import build_proposal, calculate_budget_ceiling
+from execution import SearchLimits
 from routing import route_request
 from pydantic import ValidationError
 from datetime import date, timedelta
@@ -73,6 +74,10 @@ def fake_flight_and_hotel(total_price: int | Decimal) -> tuple[FlightOffer, Hote
 
 class WorkflowTest(unittest.TestCase):
     def setUp(self):
+        self.limits = SearchLimits(
+            max_destinations=3, max_periods_per_destination=3,
+            max_outbound=3, max_serpapi_calls=50, max_llm_calls=4,
+        )
         self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("Live HTTP disabled")))
         self.fake_resolve_city = self.enterContext(patch("planning.resolve_city", side_effect=fake_city))
         self.fake_flight_search = self.enterContext(patch("planning.search_flights", side_effect=fake_flight_search))
@@ -102,6 +107,10 @@ class WorkflowTest(unittest.TestCase):
         )
 
 
+    def build_proposal(self, request):
+        # These tests exercise multiple candidates; smoke-test defaults are narrower.
+        return build_proposal(request, limits=self.limits)
+
     def test_proposal_respects_budget(self):
         request = TripRequest(
             origin = "Rome",
@@ -120,7 +129,7 @@ class WorkflowTest(unittest.TestCase):
             ),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
         self.assertNotIsInstance(result, PlanningError)
 
         for proposal in result.proposals:
@@ -205,7 +214,7 @@ class WorkflowTest(unittest.TestCase):
             ),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
         self.assertLessEqual(len(result.proposals), 3)
@@ -239,7 +248,7 @@ class WorkflowTest(unittest.TestCase):
             ),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
         self.assertNotIsInstance(result, PlanningError)
         for proposal in result.proposals:
             self.assertEqual(proposal.period.start, start)
@@ -265,7 +274,7 @@ class WorkflowTest(unittest.TestCase):
             ),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
 
@@ -436,7 +445,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
         self.fake_destination_call.assert_not_called()
@@ -454,7 +463,7 @@ class WorkflowTest(unittest.TestCase):
             vibe=TravelVibe(themes=["nature"]),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
         self.assertGreater(len(result.proposals), 0)
@@ -531,7 +540,7 @@ class WorkflowTest(unittest.TestCase):
         with patch("planning.search_flights") as flights, patch(
             "planning.search_hotels"
         ) as hotels:
-            result = build_proposal(request)
+            result = self.build_proposal(request)
 
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, expected_reason.value)
@@ -541,7 +550,10 @@ class WorkflowTest(unittest.TestCase):
         )
         event = result.trace.events[-1]
         self.assertEqual(event.reason_code, expected_reason)
-        self.assertEqual(event.details, {"agent": "destination"})
+        self.assertEqual(event.details, {
+            "agent": "destination", "serpapi_calls": 0, "llm_calls": 0,
+            **self.limits.model_dump(),
+        })
         self.fake_destination_call.assert_called_once()
         self.fake_openrouter_call.assert_not_called()
         flights.assert_not_called()
@@ -568,7 +580,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
         self.assertTrue(
@@ -632,7 +644,7 @@ class WorkflowTest(unittest.TestCase):
                 with patch("planning.search_flights", return_value=[flight]), patch(
                     "planning.search_hotels", return_value=[hotel]
                 ):
-                    result = build_proposal(request)
+                    result = self.build_proposal(request)
 
                 self.assertNotIsInstance(result, PlanningError)
                 self.assertEqual(len(result.proposals), 1)
@@ -682,7 +694,7 @@ class WorkflowTest(unittest.TestCase):
                 with patch("planning.search_flights", return_value=flights), patch(
                     "planning.search_hotels", return_value=[]
                 ):
-                    result = build_proposal(request)
+                    result = self.build_proposal(request)
 
                 self.assertIsInstance(result, PlanningError)
                 self.assertEqual(result.code, expected.value)
@@ -707,7 +719,7 @@ class WorkflowTest(unittest.TestCase):
                 with patch("planning.search_flights", return_value=[flight]), patch(
                     "planning.search_hotels", return_value=[hotel]
                 ):
-                    result = build_proposal(request)
+                    result = self.build_proposal(request)
 
                 if expected_reason == ReasonCode.OVER_MAX_BUDGET:
                     self.assertIsInstance(result, PlanningError)
@@ -742,7 +754,7 @@ class WorkflowTest(unittest.TestCase):
                 with patch("planning.search_flights", return_value=[flight]), patch(
                     "planning.search_hotels", return_value=[hotel]
                 ):
-                    result = build_proposal(request)
+                    result = self.build_proposal(request)
 
                 if total > Decimal("1198.80"):
                     self.assertIsInstance(result, PlanningError)
@@ -785,7 +797,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
         self.assertTrue(
@@ -806,7 +818,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertIsInstance(result, PlanningError)
         self.assertTrue(
@@ -824,7 +836,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
         with patch("planning.search_hotels") as hotels:
-            result = build_proposal(request)
+            result = self.build_proposal(request)
 
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.NO_FLIGHTS_FOUND.value)
@@ -834,6 +846,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(event.reason_code, ReasonCode.NO_FLIGHTS_FOUND)
         self.assertEqual(event.details, {
             "destination": "Kyoto", "start": "2026-09-15", "end": "2026-09-20",
+            "serpapi_calls": 0, "llm_calls": 0, **self.limits.model_dump(),
         })
         hotels.assert_not_called()
 
@@ -845,7 +858,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
         with patch("planning.search_hotels", return_value=[]):
-            result = build_proposal(request)
+            result = self.build_proposal(request)
 
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.NO_HOTELS_FOUND.value)
@@ -857,9 +870,11 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(failures)
         for event in failures:
             self.assertEqual(event.reason_code, ReasonCode.NO_HOTELS_FOUND)
-            self.assertEqual(event.details, {
+            self.assertEqual({key: event.details[key] for key in ("destination", "start", "end")}, {
                 "destination": "Lisbon", "start": "2026-09-15", "end": "2026-09-20",
             })
+        self.assertEqual(result.trace.events[-1].details["serpapi_calls"], 0)
+        self.assertEqual(result.trace.events[-1].details["llm_calls"], 0)
 
 
     def test_over_budget_inventory_is_not_reported_as_missing(self):
@@ -871,7 +886,7 @@ class WorkflowTest(unittest.TestCase):
                     time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
                 )
 
-                result = build_proposal(request)
+                result = self.build_proposal(request)
 
                 self.assertIsInstance(result, PlanningError)
                 self.assertEqual(result.code, ReasonCode.NO_AFFORDABLE_PROPOSAL.value)
@@ -900,12 +915,12 @@ class WorkflowTest(unittest.TestCase):
             ("hotels", ReasonCode.NO_HOTELS_FOUND),
         ):
             with self.subTest(missing_step=missing_step):
-                def available_flights(query):
+                def available_flights(query, *, max_outbound=3, budget=None):
                     if missing_step == "flights" and query.departure_date == date(2026, 9, 15):
                         return []
                     return fake_flight_search(query)
 
-                def available_hotels(query):
+                def available_hotels(query, *, budget=None):
                     if missing_step == "hotels" and query.checkin_date == date(2026, 9, 15):
                         return []
                     return fake_hotel_search(query)
@@ -913,7 +928,7 @@ class WorkflowTest(unittest.TestCase):
                 with patch("planning.search_flights", side_effect=available_flights), patch(
                     "planning.search_hotels", side_effect=available_hotels
                 ):
-                    result = build_proposal(request)
+                    result = self.build_proposal(request)
 
                 self.assertNotIsInstance(result, PlanningError)
                 self.assertTrue(result.proposals)
@@ -941,7 +956,7 @@ class WorkflowTest(unittest.TestCase):
                         time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
                     )
 
-                    result = build_proposal(request)
+                    result = self.build_proposal(request)
 
                     if budget == 100:
                         self.assertIsInstance(result, PlanningError)
@@ -967,7 +982,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
 
@@ -985,7 +1000,7 @@ class WorkflowTest(unittest.TestCase):
             destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
-        result = build_proposal(request)
+        result = self.build_proposal(request)
         self.assertNotIsInstance(result, PlanningError)
         base = result.proposals[0]
 
@@ -1031,7 +1046,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(
@@ -1084,7 +1099,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         travel_window_events = [
             event
@@ -1112,7 +1127,7 @@ class WorkflowTest(unittest.TestCase):
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
 
-        result = build_proposal(request)
+        result = self.build_proposal(request)
 
         self.assertNotIsInstance(result, PlanningError)
 
@@ -1235,7 +1250,7 @@ class WorkflowTest(unittest.TestCase):
         with patch("planning.search_flights") as fake_flights, patch(
             "planning.search_hotels"
         ) as fake_hotels:
-            result = build_proposal(request)
+            result = self.build_proposal(request)
 
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, expected_reason.value)
@@ -1488,7 +1503,7 @@ class WorkflowTest(unittest.TestCase):
             start="2026-10-06", end="2026-10-11",
         ))["selected_periods"])
         self.fake_openrouter_call.return_value = json.dumps(advice)
-        result = build_proposal(self.flight_request())
+        result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(self.fake_resolve_city.call_count, 2)
         self.assertEqual(self.fake_flight_search.call_count, 2)
@@ -1507,7 +1522,7 @@ class WorkflowTest(unittest.TestCase):
         with patch("planning.resolve_city", resolve_city), patch(
             "planning.search_flights", search_flights
         ), patch("providers.flights.search_serpapi", side_effect=responses) as api:
-            result = build_proposal(self.flight_request())
+            result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(api.call_count, 4)
         self.assertEqual(api.call_args_list[2].args[0]["departure_id"], "/m/test_rome")
@@ -1516,7 +1531,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(result.proposals[0].total_price_eur, Decimal("724.99"))
 
     def test_airports_only_restrict_queries_when_explicit(self):
-        result = build_proposal(self.flight_request(
+        result = self.build_proposal(self.flight_request(
             origin_city_id="/m/chosen_rome",
             origin_airport_code="FCO",
             destination_pref=DestinationPreference(
@@ -1524,13 +1539,13 @@ class WorkflowTest(unittest.TestCase):
             ),
         ))
         self.assertNotIsInstance(result, PlanningError)
-        self.fake_resolve_city.assert_any_call("Rome", city_id="/m/chosen_rome")
-        self.fake_resolve_city.assert_any_call("Lisbon", city_id="/m/chosen_lisbon")
+        self.fake_resolve_city.assert_any_call("Rome", city_id="/m/chosen_rome", budget=ANY)
+        self.fake_resolve_city.assert_any_call("Lisbon", city_id="/m/chosen_lisbon", budget=ANY)
         query = self.fake_flight_search.call_args.args[0]
         self.assertEqual((query.origin_id, query.destination_id), ("FCO", "LIS"))
 
     def test_unverified_airport_is_not_silently_ignored(self):
-        result = build_proposal(self.flight_request(origin_airport_code="LIN"))
+        result = self.build_proposal(self.flight_request(origin_airport_code="LIN"))
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.FLIGHT_LOCATION_UNRESOLVED.value)
         self.fake_flight_search.assert_not_called()
@@ -1539,7 +1554,7 @@ class WorkflowTest(unittest.TestCase):
         self.fake_resolve_city.side_effect = FlightLocationError(
             "Citta ambigua", options=["Rome, Italy (/m/test_rome)", "Rome, Georgia (/m/test_other)"],
         )
-        result = build_proposal(self.flight_request())
+        result = self.build_proposal(self.flight_request())
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.FLIGHT_LOCATION_UNRESOLVED.value)
         self.assertEqual(len(result.trace.events[-1].details["location_options"]), 2)
@@ -1553,7 +1568,7 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.fake_flight_search.side_effect = error
                 with patch("planning.search_hotels") as hotels:
-                    result = build_proposal(self.flight_request())
+                    result = self.build_proposal(self.flight_request())
                 self.assertIsInstance(result, PlanningError)
                 self.assertEqual(result.code, reason.value)
                 self.assertEqual(result.trace.events[-1].reason_code, reason)
@@ -1561,7 +1576,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_city_lookup_outage_has_provider_error_code(self):
         self.fake_resolve_city.side_effect = SerpAPIError("Timeout")
-        result = build_proposal(self.flight_request())
+        result = self.build_proposal(self.flight_request())
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.FLIGHT_PROVIDER_ERROR.value)
         self.fake_flight_search.assert_not_called()
@@ -1572,7 +1587,7 @@ class WorkflowTest(unittest.TestCase):
         self.fake_flight_search.side_effect = None
         self.fake_flight_search.return_value = [flight, flight.model_copy(update={"price_eur": 200})]
         with patch("planning.search_hotels", wraps=fake_hotel_search) as hotels:
-            result = build_proposal(self.flight_request())
+            result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
         hotels.assert_called_once()
         query = hotels.call_args.args[0]
@@ -1586,18 +1601,18 @@ class WorkflowTest(unittest.TestCase):
         self.fake_flight_search.side_effect = None
         self.fake_flight_search.return_value = [flight]
         with patch("planning.search_hotels") as hotels:
-            result = build_proposal(self.flight_request())
+            result = self.build_proposal(self.flight_request())
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.NO_HOTELS_FOUND.value)
         hotels.assert_not_called()
 
     def test_hotel_query_uses_verified_city_and_same_guests_as_flights(self):
-        def canonical_city(text, *, city_id=None):
+        def canonical_city(text, *, city_id=None, budget=None):
             name = {"Rome": "Rome, Italy", "Lisbon": "Lisbon, Portugal"}.get(text, text)
             return fake_city(name, city_id=city_id)
 
         self.fake_resolve_city.side_effect = canonical_city
-        result = build_proposal(self.flight_request(adults=2))
+        result = self.build_proposal(self.flight_request(adults=2))
         self.assertNotIsInstance(result, PlanningError)
         hotel_query = self.fake_hotel_search.call_args.args[0]
         self.assertEqual(hotel_query.destination, "Lisbon")
@@ -1609,7 +1624,7 @@ class WorkflowTest(unittest.TestCase):
     def test_empty_hotel_search_is_cached_for_identical_stays(self):
         self.fake_hotel_search.side_effect = None
         self.fake_hotel_search.return_value = []
-        result = build_proposal(self.flight_request())
+        result = self.build_proposal(self.flight_request())
         self.assertEqual(result.code, ReasonCode.NO_HOTELS_FOUND.value)
         self.fake_hotel_search.assert_called_once()
 
@@ -1618,7 +1633,7 @@ class WorkflowTest(unittest.TestCase):
         second.outbound.segments[-1].arrival_local += timedelta(days=1)
         self.fake_flight_search.side_effect = None
         self.fake_flight_search.return_value = [first, second]
-        result = build_proposal(self.flight_request())
+        result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(self.fake_hotel_search.call_count, 2)
         self.assertEqual(
@@ -1628,7 +1643,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_hotel_cache_is_local_to_one_planning_run(self):
         for adults in (1, 2, 2):
-            result = build_proposal(self.flight_request(adults=adults))
+            result = self.build_proposal(self.flight_request(adults=adults))
             self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(self.fake_hotel_search.call_count, 3)
         self.assertEqual([call.args[0].adults for call in self.fake_hotel_search.call_args_list], [1, 2, 2])
@@ -1639,10 +1654,10 @@ class WorkflowTest(unittest.TestCase):
             for country in ("United States", "Australia")
         ]
         flight, hotel = fake_flight_and_hotel(500)
-        self.fake_flight_search.side_effect = lambda query: [flight.model_copy(update={"destination": query.destination})]
-        self.fake_hotel_search.side_effect = lambda query: [hotel.model_copy(update={"destination": query.destination})]
+        self.fake_flight_search.side_effect = lambda query, **kwargs: [flight.model_copy(update={"destination": query.destination})]
+        self.fake_hotel_search.side_effect = lambda query, **kwargs: [hotel.model_copy(update={"destination": query.destination})]
         with patch("planning.resolve_destinations", return_value=destinations):
-            result = build_proposal(self.flight_request(destination_pref=DestinationPreference(mode="open")))
+            result = self.build_proposal(self.flight_request(destination_pref=DestinationPreference(mode="open")))
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(self.fake_hotel_search.call_count, 2)
         self.assertEqual(
@@ -1659,7 +1674,7 @@ class WorkflowTest(unittest.TestCase):
             hotel.model_copy(update={"name": "Unrated", "rating": None}),
             hotel.model_copy(update={"name": "Rated", "rating": 0.0}),
         ]
-        result = build_proposal(self.flight_request())
+        result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual([proposal.hotel.name for proposal in result.proposals], ["Rated", "Unrated"])
         self.assertIsNone(result.proposals[-1].hotel.rating)
@@ -1675,7 +1690,7 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(reason=reason, error=error.code):
                 self.fake_hotel_search.reset_mock()
                 self.fake_hotel_search.side_effect = error
-                result = build_proposal(self.flight_request())
+                result = self.build_proposal(self.flight_request())
                 self.assertIsInstance(result, PlanningError)
                 self.assertEqual(result.code, reason.value)
                 event = result.trace.events[-1]
@@ -1695,7 +1710,7 @@ class WorkflowTest(unittest.TestCase):
         self.fake_flight_search.return_value = [first, second]
         _, hotel = fake_flight_and_hotel(500)
         self.fake_hotel_search.side_effect = [[hotel], SerpAPIError("Timeout", code="TIMEOUT")]
-        result = build_proposal(self.flight_request())
+        result = self.build_proposal(self.flight_request())
         self.assertEqual(result.code, ReasonCode.HOTEL_PROVIDER_ERROR.value)
         self.assertIn(EventType.COMBINATION_ACCEPTED, [item.event_type for item in result.trace.events])
         self.assertNotIn(EventType.PROPOSALS_SELECTED, [item.event_type for item in result.trace.events])
@@ -1708,7 +1723,7 @@ class WorkflowTest(unittest.TestCase):
                 with patch("planning.search_hotels", search_hotels), patch(
                     "providers.serpapi_client.requests.get", return_value=response
                 ) as get:
-                    result = build_proposal(self.flight_request())
+                    result = self.build_proposal(self.flight_request())
                 self.assertEqual(result.code, ReasonCode.HOTEL_PROVIDER_ERROR.value)
                 self.assertEqual(result.trace.events[-1].details["provider_error"], code)
                 self.assertEqual(result.trace.events[-1].details["http_status"], status)
@@ -1719,7 +1734,7 @@ class WorkflowTest(unittest.TestCase):
         with patch("planning.search_hotels", search_hotels), patch(
             "providers.serpapi_client.requests.get", side_effect=Timeout("URL with secret")
         ):
-            result = build_proposal(self.flight_request())
+            result = self.build_proposal(self.flight_request())
         self.assertEqual(result.code, ReasonCode.HOTEL_PROVIDER_ERROR.value)
         self.assertEqual(result.trace.events[-1].details["provider_error"], "TIMEOUT")
         response = Mock(status_code=200)
@@ -1727,7 +1742,7 @@ class WorkflowTest(unittest.TestCase):
         with patch("planning.search_hotels", search_hotels), patch(
             "providers.serpapi_client.requests.get", return_value=response
         ):
-            result = build_proposal(self.flight_request())
+            result = self.build_proposal(self.flight_request())
         self.assertEqual(result.code, ReasonCode.HOTEL_OUTPUT_INVALID.value)
 
     @patch.dict("os.environ", {"SERPAPI_API_KEY": "test-key"})
@@ -1739,7 +1754,7 @@ class WorkflowTest(unittest.TestCase):
                 with patch("planning.search_hotels", search_hotels), patch(
                     "providers.serpapi_client.requests.get", return_value=response
                 ):
-                    result = build_proposal(self.flight_request())
+                    result = self.build_proposal(self.flight_request())
                 self.assertEqual(result.code, expected.value)
 
     @patch.dict("os.environ", {"SERPAPI_API_KEY": "test-key"})
@@ -1767,7 +1782,7 @@ class WorkflowTest(unittest.TestCase):
         ), patch("planning.search_hotels", search_hotels), patch(
             "providers.serpapi_client.requests.get", side_effect=responses
         ) as get:
-            result = build_proposal(self.flight_request(budget_eur=500, budget_flexibility_pct=0, adults=2))
+            result = self.build_proposal(self.flight_request(budget_eur=500, budget_flexibility_pct=0, adults=2))
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(get.call_count, 5)
         proposal = result.proposals[0]

@@ -6,6 +6,7 @@ from models import (
 )
 
 from planning import build_proposal
+from execution import SearchLimits
 
 
 
@@ -28,7 +29,7 @@ if __name__ == "__main__":
     )
 
     try:
-        result = build_proposal(request)
+        result = build_proposal(request, limits=SearchLimits())
         print(result.model_dump_json(indent=2))
     except ValueError as error:
         print(f"Impossibile creare una proposta: {error}")

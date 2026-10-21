@@ -28,7 +28,7 @@ def raw_hotel(name="Test Stay", total="249.99", nightly="50.01", rating=4.4):
     }
 
 
-def fake_hotel_search(query):
+def fake_hotel_search(query, *, budget=None):
     if query.destination != "Lisbon":
         return []
     nights = (query.checkout_date - query.checkin_date).days
@@ -58,7 +58,7 @@ class HotelProviderTest(unittest.TestCase):
             "engine": "google_hotels", "q": "Hotels in Lisbon, Portugal",
             "check_in_date": "2026-09-15", "check_out_date": "2026-09-20",
             "adults": 2, "currency": "EUR", "hl": "it", "gl": "it",
-        })
+        }, budget=None)
         self.assertEqual(len(hotels), 1)
         self.assertEqual(hotels[0].destination, "Lisbon")
         self.assertEqual(hotels[0].nights, 5)
@@ -199,7 +199,7 @@ class RecordedHotelFixtureTest(unittest.TestCase):
                         "check_out_date": query.checkout_date.isoformat(),
                         "adults": query.adults,
                         "currency": "EUR", "hl": "it", "gl": "it",
-                    })
+                    }, budget=None)
                     self.assertEqual(len(offers), len(raw_hotels))
                     for offer, raw in zip(offers, raw_hotels):
                         self.assertEqual(offer.name, raw["name"].strip())
