@@ -65,6 +65,12 @@ def recorded_rome_autocomplete():
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def supplied_valencia_autocomplete():
+    # User-supplied autocomplete fields; city type is restored from the filtered output.
+    path = Path(__file__).resolve().parent / "fixtures" / "serpapi" / "autocomplete_valencia.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def fake_flight_search(query, *, max_outbound=3, budget=None):
     if (query.origin, query.destination) != ("Rome", "Lisbon"):
         return []
@@ -289,6 +295,45 @@ class FlightProviderTest(unittest.TestCase):
         self.assertEqual(search_id_for(city, "FCO"), "FCO")
         with self.assertRaises(FlightLocationError):
             resolve_city("Rome", city_id="/m/018046")
+
+    def test_valencia_accepts_transport_ids_and_resolves_unaccented_city_name(self):
+        response = supplied_valencia_autocomplete()
+        original = json.dumps(response, ensure_ascii=False)
+        self.api.return_value = response
+        self.assertEqual(len(find_city_options("Valencia, Spain")), 5)
+        city = resolve_city("Valencia, Spain")
+        self.assertEqual(city["name"], "Val\u00e8ncia, Spain")
+        self.assertEqual(search_id_for(city), "/m/0h3tv")
+        self.assertEqual(search_id_for(city, "vlc"), "VLC")
+        self.assertIn("4GS", [place["id"] for place in city["airports"]])
+        self.assertEqual(json.dumps(response, ensure_ascii=False), original)
+
+    def test_transport_id_is_not_accepted_as_explicit_airport_or_flight_airport(self):
+        city = supplied_valencia_autocomplete()["suggestions"][0]
+        with self.assertRaises(FlightLocationError):
+            search_id_for(city, "4GS")
+        leg = raw_leg(destination="4GS")
+        with self.assertRaises(SerpAPIResponseError):
+            parse_flight_leg(leg)
+        with self.assertRaises(ValidationError):
+            FlightSearchQuery(**{**self.query.model_dump(), "destination_id": "4GS"})
+
+    def test_accent_normalization_does_not_pick_a_city_when_multiple_ids_match(self):
+        first = supplied_valencia_autocomplete()["suggestions"][0]
+        second = {**first, "name": "Valencia, Spain", "id": "/m/test_other_valencia"}
+        self.api.return_value = {"suggestions": [first, second]}
+        with self.assertRaises(FlightLocationError) as caught:
+            resolve_city("Valencia, Spain")
+        self.assertEqual(len(caught.exception.options), 2)
+        self.assertEqual(resolve_city("Valencia, Spain", city_id="/m/0h3tv"), first)
+
+    def test_malformed_transport_locations_are_still_invalid(self):
+        for locations in (None, {}, [None], [{"id": ""}], [{"id": "bad"}], [{"id": "ABCD"}], [{"id": 123}]):
+            with self.subTest(locations=locations):
+                self.api.return_value = {"suggestions": [{**fake_city("Rome"), "airports": locations}]}
+                with self.assertRaises(SerpAPIResponseError) as caught:
+                    find_city_options("Rome")
+                self.assertEqual(caught.exception.kind, "invalid_city_locations")
 
     def test_autocomplete_without_cities_needs_clarification(self):
         for kind in (None, "region", "airport", "unknown"):

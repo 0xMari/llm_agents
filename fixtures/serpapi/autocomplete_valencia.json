@@ -1,0 +1,55 @@
+{
+  "suggestions": [
+    {
+      "name": "València, Spain",
+      "type": "city",
+      "id": "/m/0h3tv",
+      "airports": [
+        {"name": "Valencia Airport", "id": "VLC", "city": "València", "city_id": "/m/0h3tv", "distance": "8 km"},
+        {"name": "Valencia", "id": "YJV", "city": "València", "city_id": "/m/0h3tv"},
+        {"name": "Joaquín Sorolla", "id": "4GS", "city": "València", "city_id": "/m/0h3tv", "distance": "1 km"}
+      ]
+    },
+    {
+      "name": "Valencia de Alcántara, Spain",
+      "type": "city",
+      "id": "/m/069hf2",
+      "airports": [
+        {"name": "Humberto Delgado Airport", "id": "LIS", "city": "Lisbon", "city_id": "/m/04llb", "distance": "177 km"},
+        {"name": "Badajoz Airport", "id": "BJZ", "city": "Badajoz", "city_id": "/m/0f_8w", "distance": "68 km"},
+        {"name": "Badajoz", "id": "BQZ", "city": "Badajoz", "city_id": "/m/0f_8w", "distance": "62 km"}
+      ]
+    },
+    {
+      "name": "Valencia de Don Juan, Spain",
+      "type": "city",
+      "id": "/m/02z90jf",
+      "airports": [
+        {"name": "Adolfo Suárez Madrid-Barajas Airport", "id": "MAD", "city": "Madrid", "city_id": "/m/056_y", "distance": "257 km"},
+        {"name": "Asturias Airport", "id": "OVD", "city": "Aviles", "city_id": "/m/044_01", "distance": "146 km"},
+        {"name": "Bilbao Airport", "id": "BIO", "city": "Bilbao", "city_id": "/m/0htqt", "distance": "240 km"},
+        {"name": "León Airport", "id": "LEN", "city": "León", "city_id": "/m/01s2b7", "distance": "34 km"},
+        {"name": "Leon", "id": "EEU", "city": "León", "city_id": "/m/01s2b7", "distance": "34 km"}
+      ]
+    },
+    {
+      "name": "València d'Àneu, Spain",
+      "type": "city",
+      "id": "/g/120jw_ct",
+      "airports": [
+        {"name": "Josep Tarradellas Barcelona-El Prat Airport", "id": "BCN", "city": "Barcelona", "city_id": "/m/01f62", "distance": "167 km"},
+        {"name": "Toulouse-Blagnac Airport", "id": "TLS", "city": "Toulouse", "city_id": "/m/0cbhh", "distance": "113 km"},
+        {"name": "Andorra–La Seu d’Urgell Airport", "id": "LEU", "city": "La Seu d'Urgell", "city_id": "/m/0jhrt", "distance": "39 km"}
+      ]
+    },
+    {
+      "name": "Valencia del Ventoso, Spain",
+      "type": "city",
+      "id": "/m/02z7mh1",
+      "airports": [
+        {"name": "Seville Airport", "id": "SVQ", "city": "Seville", "city_id": "/m/09f3c", "distance": "107 km"},
+        {"name": "Badajoz Airport", "id": "BJZ", "city": "Badajoz", "city_id": "/m/0f_8w", "distance": "75 km"}
+      ]
+    }
+  ]
+}

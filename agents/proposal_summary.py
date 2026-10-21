@@ -22,6 +22,14 @@ SYSTEM_PROMPT = (
     "senza fare nuovi calcoli. Il totale copre solo voli e alloggio, per tutti "
     "gli adulti indicati, non ogni spesa della vacanza. "
     "I confronti valgono solo fra le proposte selezionate, non per tutto il mercato. "
+    "Con request.destination_mode='open' ogni proposta rappresenta una citta "
+    "distinta, ordinata per pertinenza stimata alla richiesta: spiega il legame "
+    "con la vibe usando reason e themes_matched della destinazione, senza "
+    "trasformare le stime LLM in garanzie. Non presentare la prima proposta "
+    "come la piu economica o comoda se i dati non lo indicano. selection_profiles "
+    "confronta solo le combinazioni mostrate e puo essere vuoto; non inventare "
+    "un profilo balanced per riempirlo. Se manca la vibe non attribuire all'utente "
+    "interessi non dichiarati. "
     "comparison contiene differenze rispetto a reference_id: valori negativi "
     "indicano riduzioni. extra_price_eur riguarda l'intera combinazione: hotel, "
     "destinazione o periodo possono essere diversi, quindi non attribuirlo "
@@ -106,6 +114,7 @@ def summarize_proposals(
     payload = {
         "request": {
             "origin": request.origin,
+            "destination_mode": request.destination_pref.mode,
             "adults": request.adults,
             "budget_eur": request.budget_eur,
             "budget_flexibility_pct": request.budget_flexibility_pct,

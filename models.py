@@ -1,4 +1,4 @@
-from typing import Self, Literal
+from typing import Self, Literal, Annotated
 from pydantic import BaseModel, Field, model_validator, ConfigDict, HttpUrl
 from datetime import date, datetime
 from decimal import Decimal
@@ -276,6 +276,7 @@ class EventType(StrEnum):
     PROPOSAL_SUMMARY_GENERATED = "PROPOSAL_SUMMARY_GENERATED"
     PROPOSAL_SUMMARY_FAILED = "PROPOSAL_SUMMARY_FAILED"
     SEARCH_FAILED = "SEARCH_FAILED"
+    DESTINATION_SEARCH_FAILED = "DESTINATION_SEARCH_FAILED"
     TRAVEL_WINDOW_FAILED = "TRAVEL_WINDOW_FAILED"
 
 
@@ -302,6 +303,7 @@ class ReasonCode(StrEnum):
     DIRECT_FLIGHT = "DIRECT_FLIGHT"
     GOOD_HOTEL_RATING = "GOOD_HOTEL_RATING"
     SELECTED_BY_TRADEOFF = "SELECTED_BY_TRADEOFF"
+    SELECTED_BY_DESTINATION_MATCH = "SELECTED_BY_DESTINATION_MATCH"
     PROPOSAL_SUMMARY_GENERATED = "PROPOSAL_SUMMARY_GENERATED"
     NO_AFFORDABLE_PROPOSAL = "NO_AFFORDABLE_PROPOSAL"
     LLM_PROVIDER_ERROR = "LLM_PROVIDER_ERROR"
@@ -309,16 +311,20 @@ class ReasonCode(StrEnum):
     LLM_CONSTRAINT_VIOLATION = "LLM_CONSTRAINT_VIOLATION"
 
 
+# A strict Decimal branch prevents JSON lists being parsed as Decimal tuples.
+DecisionDetailValue = list[str] | Annotated[Decimal, Field(strict=True)] | str | int | float | bool | None
+
+
 class DecisionEvent(BaseModel):
     event_type: EventType
     reason_code: ReasonCode
-    details: dict[str, Decimal | str | int | float | bool | list[str] | None] = Field(default_factory=dict)
+    details: dict[str, DecisionDetailValue] = Field(default_factory=dict)
     comment: str | None = None
 
 
 class ProposalComment(BaseModel):
     reason_code: ReasonCode
-    details: dict[str, Decimal | str | int | float | bool | list[str] | None] = Field(default_factory=dict)
+    details: dict[str, DecisionDetailValue] = Field(default_factory=dict)
     comment: str
 
 
@@ -352,6 +358,7 @@ class ProposalSummaries(BaseModel):
 
 class TripProposal(BaseModel):
     destination: SuggestedDestination
+    destination_city_id: str | None = Field(default=None, pattern=CITY_ID_PATTERN)
     period: SuggestedTimePeriod
     flight: FlightOffer
     hotel: HotelOffer
@@ -366,10 +373,20 @@ class TripProposal(BaseModel):
     travel_context: ProposalTravelContext | None = None
 
 
+class DestinationSearchIssue(BaseModel):
+    destination: str
+    country: str | None = None
+    stage: Literal["location_resolution", "flight_search", "hotel_search"]
+    code: ReasonCode
+    message: str
+
+
 class TripSearchResult(BaseModel):
     proposals: list[TripProposal] = Field(min_length=1, max_length=3)
     trace: DecisionTrace
     summary_status: Literal["not_requested", "generated", "unavailable"] = "not_requested"
+    search_status: Literal["complete", "partial"] = "complete"
+    search_issues: list[DestinationSearchIssue] = Field(default_factory=list)
 
 
 class PlanningError(BaseModel):

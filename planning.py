@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Literal
 
 from comparison import add_comparisons
 from execution import RunBudget, SearchLimitExceeded, SearchLimits
@@ -17,6 +18,7 @@ from agents.travel_window import evaluate_travel_window
 from models import (
     DecisionEvent,
     DecisionTrace,
+    DestinationSearchIssue,
     EventType,
     FlightSearchQuery,
     HotelSearchQuery,
@@ -54,8 +56,14 @@ def calculate_budget_ceiling(request: TripRequest) -> Decimal | None:
     return Decimal(request.budget_eur) * (100 + request.budget_flexibility_pct) / 100
 
 
-def flight_search_failure(events: list[DecisionEvent], destination: str, error: SerpAPIError | FlightLocationError) -> PlanningError:
-    details: dict[str, str | int | list[str] | None] = {"destination": destination}
+def flight_search_failure(
+    events: list[DecisionEvent], destination: str, error: SerpAPIError | FlightLocationError,
+    *, stage: Literal["location_resolution", "flight_search"] = "flight_search",
+    location_role: str | None = None,
+) -> PlanningError:
+    details: dict[str, str | int | list[str] | None] = {"destination": destination, "stage": stage}
+    if location_role is not None:
+        details["location_role"] = location_role
     if isinstance(error, SerpAPIError):
         details.update(provider_error=error.code, http_status=error.status_code)
     if isinstance(error, FlightLocationError):
@@ -64,7 +72,12 @@ def flight_search_failure(events: list[DecisionEvent], destination: str, error: 
         details["location_options"] = error.options
     elif isinstance(error, SerpAPIResponseError):
         reason = ReasonCode.FLIGHT_OUTPUT_INVALID
-        message = "La ricerca voli ha restituito dati non utilizzabili."
+        details["response_error_kind"] = error.kind
+        message = (
+            "La ricerca localita ha restituito dati non utilizzabili."
+            if stage == "location_resolution" else
+            "La ricerca voli ha restituito dati non utilizzabili."
+        )
     else:
         reason = ReasonCode.FLIGHT_PROVIDER_ERROR
         message = "Il servizio di ricerca voli non e disponibile. Verifica configurazione e quota."
@@ -95,10 +108,25 @@ def hotel_search_failure(events: list[DecisionEvent], query: HotelSearchQuery, e
             "adults": query.adults,
             "provider_error": error.code,
             "http_status": error.status_code,
+            "stage": "hotel_search",
+            "response_error_kind": error.kind if isinstance(error, SerpAPIResponseError) else None,
         },
         comment=message,
     ))
     return PlanningError(code=reason.value, message=message, trace=DecisionTrace(events=events))
+
+
+def record_destination_issue(
+    events: list[DecisionEvent], issues: list[DestinationSearchIssue],
+    destination: SuggestedDestination, failure: PlanningError,
+    stage: Literal["location_resolution", "flight_search", "hotel_search"],
+) -> None:
+    events[-1].event_type = EventType.DESTINATION_SEARCH_FAILED
+    events[-1].details["scope"] = "destination"
+    issues.append(DestinationSearchIssue(
+        destination=destination.name, country=destination.country,
+        stage=stage, code=failure.code, message=failure.message,
+    ))
 
 
 def build_proposal(request: TripRequest, *, limits: SearchLimits) -> TripSearchResult | PlanningError:
@@ -157,6 +185,8 @@ def _build_proposal(
     budget_ceiling = calculate_budget_ceiling(request)
     city_cache = {}
     hotel_cache = {}
+    failed_hotel_stays = set()
+    search_issues = []
 
     events.append(
         DecisionEvent(
@@ -272,13 +302,21 @@ def _build_proposal(
         ]
         search_ids = []
         try:
-            for text, city_id, airport_code in locations:
+            for location_index, (text, city_id, airport_code) in enumerate(locations):
                 key = (text, city_id)
                 if key not in city_cache:
                     city_cache[key] = resolve_city(text, city_id=city_id, budget=budget)
                 search_ids.append(search_id_for(city_cache[key], airport_code))
         except (SerpAPIError, FlightLocationError) as error:
-            return flight_search_failure(events, destination.name, error)
+            failure = flight_search_failure(
+                events, destination.name, error, stage="location_resolution",
+                location_role="origin" if location_index == 0 else "destination",
+            )
+            if (request.destination_pref.mode == "open" and location_index == 1
+                    and isinstance(error, (SerpAPIResponseError, FlightLocationError))):
+                record_destination_issue(events, search_issues, destination, failure, "location_resolution")
+                continue
+            return failure
 
         destination_city = city_cache[(destination_text, request.destination_pref.city_id)]
 
@@ -309,7 +347,11 @@ def _build_proposal(
             try:
                 flights = search_flights(flight_query, max_outbound=limits.max_outbound, budget=budget)
             except SerpAPIError as error:
-                return flight_search_failure(events, destination.name, error)
+                failure = flight_search_failure(events, destination.name, error)
+                if request.destination_pref.mode == "open" and isinstance(error, SerpAPIResponseError):
+                    record_destination_issue(events, search_issues, destination, failure, "flight_search")
+                    continue
+                return failure
 
             if not flights:
                 events.append(
@@ -347,11 +389,18 @@ def _build_proposal(
                     adults = flight_query.adults,
                 )
                 stay_key = (hotel_query.location_name, checkin, checkout, hotel_query.adults)
+                if stay_key in failed_hotel_stays:
+                    continue
                 if stay_key not in hotel_cache:
                     try:
                         hotel_cache[stay_key] = search_hotels(hotel_query, budget=budget)
                     except SerpAPIError as error:
-                        return hotel_search_failure(events, hotel_query, error)
+                        failure = hotel_search_failure(events, hotel_query, error)
+                        if request.destination_pref.mode == "open" and isinstance(error, SerpAPIResponseError):
+                            failed_hotel_stays.add(stay_key)
+                            record_destination_issue(events, search_issues, destination, failure, "hotel_search")
+                            continue
+                        return failure
                 hotels = hotel_cache[stay_key]
 
                 if not hotels:
@@ -446,6 +495,7 @@ def _build_proposal(
                     proposals.append(
                         TripProposal(
                             destination=destination,
+                            destination_city_id=destination_city["id"],
                             period = period,
                             flight = flight,
                             hotel = hotel,
@@ -461,6 +511,15 @@ def _build_proposal(
                     )
 
     if not proposals:
+        if search_issues:
+            reason = search_issues[0].code
+            message = "Nessuna proposta utilizzabile: alcune ricerche sulle destinazioni non sono state completate."
+            events.append(DecisionEvent(
+                event_type=EventType.SEARCH_FAILED, reason_code=reason,
+                details={"affected_destinations": list(dict.fromkeys(issue.destination for issue in search_issues))},
+                comment=message,
+            ))
+            return PlanningError(code=reason.value, message=message, trace=DecisionTrace(events=events))
         if not found_flights:
             reason = ReasonCode.NO_FLIGHTS_FOUND
             message = "Nessun volo trovato per le destinazioni e i periodi cercati."
@@ -515,17 +574,31 @@ def _build_proposal(
     events.append(
         DecisionEvent(
             event_type = EventType.PROPOSALS_SELECTED,
-            reason_code = ReasonCode.SELECTED_BY_TRADEOFF,
+            reason_code = (
+                ReasonCode.SELECTED_BY_DESTINATION_MATCH
+                if request.destination_pref.mode == "open"
+                else ReasonCode.SELECTED_BY_TRADEOFF
+            ),
             details = {
                 "selected_count": len(selected),
                 "summary_status": summary_status,
+                "destination_mode": request.destination_pref.mode,
+                "search_status": "partial" if search_issues else "complete",
+                "affected_destinations": list(dict.fromkeys(issue.destination for issue in search_issues)),
+                "destination_city_ids": list(dict.fromkeys(p.destination_city_id for p in selected)),
             },
-            comment = "Selezionate fino a tre combinazioni per prezzo e comodita del volo, nel rispetto del budget.",
+            comment = (
+                "Selezionata una combinazione per citta, fino a tre, ordinate per pertinenza stimata alla richiesta e nel rispetto del budget."
+                if request.destination_pref.mode == "open" else
+                "Selezionate fino a tre combinazioni per prezzo e comodita del volo, nel rispetto del budget."
+            ),
         )
     )
 
     return TripSearchResult(
         proposals=selected,
         summary_status=summary_status,
+        search_status="partial" if search_issues else "complete",
+        search_issues=search_issues,
         trace = DecisionTrace(events=events),
     )

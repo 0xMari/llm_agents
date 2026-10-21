@@ -1701,6 +1701,7 @@ class WorkflowTest(unittest.TestCase):
         self.fake_resolve_city.assert_any_call("Lisbon", city_id="/m/chosen_lisbon", budget=ANY)
         query = self.fake_flight_search.call_args.args[0]
         self.assertEqual((query.origin_id, query.destination_id), ("FCO", "LIS"))
+        self.assertTrue(all(p.destination_city_id == "/m/chosen_lisbon" for p in result.proposals))
 
     def test_unverified_airport_is_not_silently_ignored(self):
         result = self.build_proposal(self.flight_request(origin_airport_code="LIN"))
@@ -1812,11 +1813,17 @@ class WorkflowTest(unittest.TestCase):
             for country in ("United States", "Australia")
         ]
         flight, hotel = fake_flight_and_hotel(500)
+        def resolve_homonym(text, **kwargs):
+            if text.startswith("Springfield"):
+                return fake_city(text, city_id="/m/test_us" if text.endswith("United States") else "/m/test_au")
+            return fake_city(text, **kwargs)
+        self.fake_resolve_city.side_effect = resolve_homonym
         self.fake_flight_search.side_effect = lambda query, **kwargs: [flight.model_copy(update={"destination": query.destination})]
         self.fake_hotel_search.side_effect = lambda query, **kwargs: [hotel.model_copy(update={"destination": query.destination})]
         with patch("planning.resolve_destinations", return_value=destinations):
             result = self.build_proposal(self.flight_request(destination_pref=DestinationPreference(mode="open")))
         self.assertNotIsInstance(result, PlanningError)
+        self.assertEqual({p.destination_city_id for p in result.proposals}, {"/m/test_us", "/m/test_au"})
         self.assertEqual(self.fake_hotel_search.call_count, 2)
         self.assertEqual(
             {call.args[0].location_name for call in self.fake_hotel_search.call_args_list},

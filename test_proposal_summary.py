@@ -14,6 +14,7 @@ from models import (
 )
 from scoring import select_final_proposals
 from test_scoring import tradeoff_proposal
+from test_open_destination_selection import city_proposal
 
 
 def fake_summary_response(messages, **kwargs):
@@ -37,7 +38,7 @@ class ProposalSummaryTest(unittest.TestCase):
         ))
         self.request = TripRequest(
             origin="Rome", budget_eur=900, budget_flexibility_pct=0,
-            destination_pref=DestinationPreference(mode="open"),
+            destination_pref=DestinationPreference(mode="fixed", destination="Paris"),
             time_pref=TimePreference(mode="exact_dates", start_date="2026-12-05", end_date="2026-12-10"),
         )
         candidates = [tradeoff_proposal("100", stops=2), tradeoff_proposal("150", stops=1), tradeoff_proposal("200")]
@@ -221,6 +222,24 @@ class ProposalSummaryTest(unittest.TestCase):
         self.assertIsNone(proposal.travel_context)
         old_result = TripSearchResult.model_validate({"proposals": [legacy], "trace": {"events": []}})
         self.assertEqual(old_result.summary_status, "not_requested")
+
+    def test_open_mode_preserves_city_ranking_and_explains_mode_to_summary_agent(self):
+        request = self.request.model_copy(update={"destination_pref": DestinationPreference(mode="open")})
+        proposals = [
+            city_proposal("Paris", "France", "/m/test_paris", "100", score=60),
+            city_proposal("Lisbon", "Portugal", "/m/test_lisbon", "150", score=100, stops=1),
+            city_proposal("Vienna", "Austria", "/m/test_vienna", "200", score=90, stops=2),
+        ]
+        selected = add_comparisons(select_final_proposals(proposals, request))
+        result = summarize_proposals(request, selected)
+        self.call.assert_called_once()
+        payload = json.loads(self.call.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["request"]["destination_mode"], "open")
+        self.assertEqual([p.destination.name for p in result], ["Lisbon", "Vienna", "Paris"])
+        self.assertEqual([p.comparison.reference_id for p in result], ["p3"] * 3)
+        self.assertEqual([p.selection_profiles for p in result], [[], [], ["cheapest", "comfortable"]])
+        self.assertEqual([p.summary.proposal_id for p in result], ["p1", "p2", "p3"])
+        self.assertEqual(payload["proposals"][0]["destination"]["themes_matched"], ["museums"])
 
 
 if __name__ == "__main__":

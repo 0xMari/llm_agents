@@ -16,6 +16,16 @@ class SerpAPIError(RuntimeError):
 class SerpAPIResponseError(SerpAPIError):
     code = "INVALID_RESPONSE"
 
+    def __init__(self, message: str, *, kind: str = "invalid_response", **kwargs):
+        super().__init__(message, **kwargs)
+        allowed = {
+            "invalid_response", "invalid_json", "invalid_payload", "invalid_metadata",
+            "invalid_status", "missing_results", "invalid_results", "invalid_city",
+            "invalid_city_locations", "invalid_flight_leg", "flight_date_mismatch",
+            "flight_airport_mismatch", "missing_departure_token", "invalid_flight_offer",
+        }
+        self.kind = kind if isinstance(kind, str) and kind in allowed else "invalid_response"
+
 
 def search(params, *, budget: RunBudget | None = None):
     api_key = os.environ.get("SERPAPI_API_KEY")
@@ -41,17 +51,17 @@ def search(params, *, budget: RunBudget | None = None):
     try:
         data = response.json()
     except ValueError:
-        raise SerpAPIResponseError("Risposta JSON non valida.") from None
+        raise SerpAPIResponseError("Risposta JSON non valida.", kind="invalid_json") from None
     if not isinstance(data, dict):
-        raise SerpAPIResponseError("Formato della risposta inatteso.")
+        raise SerpAPIResponseError("Formato della risposta inatteso.", kind="invalid_payload")
     metadata = data.get("search_metadata")
     if not isinstance(metadata, dict):
-        raise SerpAPIResponseError("Metadati della ricerca mancanti o invalidi.")
+        raise SerpAPIResponseError("Metadati della ricerca mancanti o invalidi.", kind="invalid_metadata")
     status = metadata.get("status")
     if status == "Error":
         raise SerpAPIError("Ricerca SerpAPI non completata correttamente.", code="SEARCH_ERROR")
     if status in ("Processing", "Queued"):
         raise SerpAPIError("Ricerca SerpAPI non ancora completata.", code="SEARCH_PENDING")
     if status != "Success":
-        raise SerpAPIResponseError("Stato della ricerca mancante o non valido.")
+        raise SerpAPIResponseError("Stato della ricerca mancante o non valido.", kind="invalid_status")
     return data

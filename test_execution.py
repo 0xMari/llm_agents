@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from decimal import Decimal
 import json
 import unittest
 from unittest.mock import Mock, patch
@@ -8,11 +9,11 @@ from requests.exceptions import Timeout
 
 from execution import RunBudget, SearchLimitExceeded, SearchLimits
 from llm.openrouter import OpenRouterError, call_openrouter_json
-from models import DestinationPreference, EventType, PlanningError, ReasonCode, TimePreference, TripRequest, TripSearchResult
+from models import DecisionEvent, DestinationPreference, EventType, PlanningError, ProposalComment, ReasonCode, TimePreference, TripRequest, TripSearchResult
 from planning import build_proposal
 from providers.flights import FlightLocationError, find_city_options, search_flights
 from providers.serpapi_client import SerpAPIError, search
-from test_flights import fake_city, raw_leg, recorded_rome_autocomplete
+from test_flights import fake_city, raw_leg, recorded_rome_autocomplete, supplied_valencia_autocomplete
 from test_hotels import raw_hotel
 from test_proposal_summary import fake_summary_response
 
@@ -24,6 +25,15 @@ def http_response(payload, status=200):
 
 
 class RunBudgetTest(unittest.TestCase):
+    def test_trace_string_lists_round_trip_without_decimal_tuple_conversion(self):
+        for values in ([], ["Lisbon"], ["Lisbon", "Valencia"], ["Lisbon", "Valencia", "Prague"], ["a", "b", "c", "d"]):
+            with self.subTest(values=values):
+                details = {"destinations": values, "price": Decimal("232.50"), "count": 3, "score": 1.5, "flag": True, "missing": None}
+                event = DecisionEvent(event_type=EventType.DESTINATIONS_RESOLVED, reason_code=ReasonCode.OPEN_DESTINATION_SUGGESTED, details=details)
+                comment = ProposalComment(reason_code=ReasonCode.OPEN_DESTINATION_SUGGESTED, comment="Test", details=details)
+                self.assertEqual(DecisionEvent.model_validate_json(event.model_dump_json()), event)
+                self.assertEqual(ProposalComment.model_validate_json(comment.model_dump_json()), comment)
+
     def test_limits_reject_invalid_types_and_ranges(self):
         for name in SearchLimits.model_fields:
             for value in (True, "1", 1.5, -1, None):
@@ -291,6 +301,230 @@ class PlannerLimitsTest(unittest.TestCase):
         self.assertEqual(scope.details["scope"], "destinations")
         self.assertEqual((scope.details["available_count"], scope.details["selected_count"]), (2, 1))
         self.assertEqual(result.trace.events[-1].details["llm_calls"], 3)
+
+    def mock_three_cities(self, *, use_valencia=False):
+        cities = {
+            "Paris, France": ("/m/test_paris", "ORY", 100, (), 60),
+            "Lisbon, Portugal": ("/m/04llb", "LIS", 150, ("MAD",), 100),
+            "Vienna, Austria": ("/m/test_vienna", "VIE", 200, ("MAD", "BCN"), 90),
+        }
+        if use_valencia:
+            del cities["Vienna, Austria"]
+            cities["Valencia, Spain"] = ("/m/0h3tv", "VLC", 200, ("MAD", "BCN"), 90)
+        self.destinations = [
+            self.destination(*name.split(", "), data[4]) for name, data in cities.items()
+        ]
+        original = self.serpapi_response
+
+        def response(url, *, params, **kwargs):
+            engine = params["engine"]
+            if engine == "google_flights_autocomplete":
+                if params["q"] == "Rome":
+                    return original(url, params=params, **kwargs)
+                if use_valencia and params["q"] == "Valencia, Spain":
+                    return http_response({"search_metadata": {"status": "Success"}, **supplied_valencia_autocomplete()})
+                city_id, airport, *_ = cities[params["q"]]
+                city = fake_city(params["q"], city_id=city_id)
+                city["airports"] = [{"id": airport}]
+                payload = {"suggestions": [city]}
+            elif engine == "google_flights":
+                city_id, airport, price, via, _ = next(data for data in cities.values() if data[0] == params["arrival_id"])
+                if "departure_token" in params:
+                    payload = {"other_flights": [
+                        raw_leg(airport, "FCO", date.fromisoformat(params["return_date"]), price=price + extra)
+                        for extra in (0, 10)
+                    ]}
+                else:
+                    payload = {"best_flights": [raw_leg(
+                        "FCO", airport, date.fromisoformat(params["outbound_date"]), via=via, token=f"token-{city_id}",
+                    )]}
+            else:
+                self.assertEqual(engine, "google_hotels")
+                payload = {"properties": [raw_hotel(name=params["q"], total="300")]}
+            return http_response({"search_metadata": {"status": "Success"}, **payload})
+
+        self.get.side_effect = response
+
+    def test_three_city_pipeline_keeps_vibe_order_and_does_not_add_provider_calls(self):
+        self.mock_three_cities()
+        limits = SearchLimits(max_destinations=3, max_serpapi_calls=13, max_llm_calls=5)
+        result = build_proposal(self.open_request(), limits=limits)
+        self.assertIsInstance(result, TripSearchResult)
+        self.assertEqual([p.destination.name for p in result.proposals], ["Lisbon", "Vienna", "Paris"])
+        self.assertEqual([p.destination_city_id for p in result.proposals], ["/m/04llb", "/m/test_vienna", "/m/test_paris"])
+        self.assertEqual([p.total_price_eur for p in result.proposals], [450, 500, 400])
+        self.assertEqual([p.selection_profiles for p in result.proposals], [[], [], ["cheapest", "comfortable"]])
+        self.assertEqual([p.comparison.reference_id for p in result.proposals], ["p3"] * 3)
+        self.assertEqual([p.summary.proposal_id for p in result.proposals], ["p1", "p2", "p3"])
+        self.assertEqual(result.summary_status, "generated")
+        self.assertEqual(self.get.call_count, 13)
+        self.assertEqual(self.post.call_count, 5)
+        self.assertEqual(TripSearchResult.model_validate_json(result.model_dump_json()), result)
+        self.assertEqual(
+            [call.kwargs["json"]["response_format"]["json_schema"]["name"] for call in self.post.call_args_list],
+            ["destination_advice", "travel_window_advice", "travel_window_advice", "travel_window_advice", "proposal_summaries"],
+        )
+        summary_payload = json.loads(self.post.call_args.kwargs["json"]["messages"][1]["content"])
+        self.assertEqual(summary_payload["request"]["destination_mode"], "open")
+        self.assertEqual([p["destination"]["name"] for p in summary_payload["proposals"]], ["Lisbon", "Vienna", "Paris"])
+        event = result.trace.events[-1]
+        self.assertEqual(event.reason_code, ReasonCode.SELECTED_BY_DESTINATION_MATCH)
+        self.assertEqual(event.details["destination_mode"], "open")
+        self.assertEqual(event.details["destination_city_ids"], [p.destination_city_id for p in result.proposals])
+        self.assertEqual(event.details["serpapi_calls"], 13)
+        self.assertEqual(event.details["llm_calls"], 5)
+
+    def test_city_diversity_never_bypasses_budget_or_forces_three_results(self):
+        self.mock_three_cities()
+        request = self.open_request().model_copy(update={"budget_eur": 450, "budget_flexibility_pct": 0})
+        result = build_proposal(request, limits=SearchLimits(max_destinations=3, max_serpapi_calls=13, max_llm_calls=5))
+        self.assertIsInstance(result, TripSearchResult)
+        self.assertEqual([p.destination.name for p in result.proposals], ["Lisbon", "Paris"])
+        self.assertTrue(all(p.total_price_eur <= 450 for p in result.proposals))
+        self.assertEqual(result.trace.events[-1].details["selected_count"], 2)
+
+    def test_supplied_valencia_response_completes_three_city_search(self):
+        self.mock_three_cities(use_valencia=True)
+        result = build_proposal(self.open_request(), limits=SearchLimits(
+            max_destinations=3, max_serpapi_calls=13, max_llm_calls=5,
+        ))
+        self.assertIsInstance(result, TripSearchResult)
+        self.assertEqual([p.destination.name for p in result.proposals], ["Lisbon", "Valencia", "Paris"])
+        self.assertEqual(result.proposals[1].destination_city_id, "/m/0h3tv")
+        self.assertEqual(result.proposals[1].flight.outbound.segments[-1].arrival_airport, "VLC")
+        self.assertEqual(result.search_status, "complete")
+        self.assertEqual(result.search_issues, [])
+        self.assertEqual(result.summary_status, "generated")
+        self.assertEqual(self.get.call_count, 13)
+        self.assertEqual(self.post.call_count, 5)
+
+    def fail_middle_city(self, stage):
+        self.mock_three_cities()
+        original = self.get.side_effect
+
+        def response(url, *, params, **kwargs):
+            failure = (
+                stage == "location_resolution" and params.get("q") == "Vienna, Austria"
+                or stage == "flight_search" and params.get("arrival_id") == "/m/test_vienna"
+                or stage == "hotel_search" and params.get("q") == "Hotels in Vienna, Austria"
+            )
+            if failure:
+                return http_response({"search_metadata": {"status": "Success"}})
+            return original(url, params=params, **kwargs)
+
+        self.get.side_effect = response
+
+    def test_invalid_destination_data_preserves_other_cities_and_reports_partial_search(self):
+        for stage, calls, code in (
+            ("location_resolution", 10, ReasonCode.FLIGHT_OUTPUT_INVALID),
+            ("flight_search", 11, ReasonCode.FLIGHT_OUTPUT_INVALID),
+            ("hotel_search", 13, ReasonCode.HOTEL_OUTPUT_INVALID),
+        ):
+            with self.subTest(stage=stage):
+                self.get.reset_mock()
+                self.post.reset_mock()
+                self.fail_middle_city(stage)
+                result = build_proposal(self.open_request(), limits=SearchLimits(
+                    max_destinations=3, max_serpapi_calls=13, max_llm_calls=5,
+                ))
+                self.assertIsInstance(result, TripSearchResult)
+                self.assertEqual([p.destination.name for p in result.proposals], ["Lisbon", "Paris"])
+                self.assertEqual(result.search_status, "partial")
+                self.assertEqual(result.summary_status, "generated")
+                self.assertEqual(len(result.search_issues), 1)
+                issue = result.search_issues[0]
+                self.assertEqual((issue.destination, issue.country, issue.stage, issue.code), ("Vienna", "Austria", stage, code))
+                failures = [event for event in result.trace.events if event.event_type == EventType.DESTINATION_SEARCH_FAILED]
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0].details["scope"], "destination")
+                self.assertEqual(failures[0].details["stage"], stage)
+                self.assertEqual(failures[0].details["response_error_kind"], "invalid_response" if stage == "hotel_search" else "missing_results")
+                self.assertEqual(result.trace.events[-1].details["search_status"], "partial")
+                self.assertEqual(result.trace.events[-1].details["affected_destinations"], ["Vienna"])
+                self.assertEqual(self.get.call_count, calls)
+                self.assertEqual(self.post.call_count, 5)
+                self.assertEqual(TripSearchResult.model_validate_json(result.model_dump_json()), result)
+
+    def test_all_destination_lookups_invalid_return_an_error_not_empty_inventory(self):
+        self.mock_three_cities()
+        original = self.get.side_effect
+
+        def response(url, *, params, **kwargs):
+            if params["engine"] == "google_flights_autocomplete" and params["q"] != "Rome":
+                return http_response({"search_metadata": {"status": "Success"}})
+            return original(url, params=params, **kwargs)
+
+        self.get.side_effect = response
+        result = build_proposal(self.open_request(), limits=SearchLimits(
+            max_destinations=3, max_serpapi_calls=13, max_llm_calls=5,
+        ))
+        self.assertIsInstance(result, PlanningError)
+        self.assertEqual(result.code, "FLIGHT_OUTPUT_INVALID")
+        self.assertEqual(sum(e.event_type == EventType.DESTINATION_SEARCH_FAILED for e in result.trace.events), 3)
+        self.assertEqual(result.trace.events[-1].event_type, EventType.SEARCH_FAILED)
+        self.assertEqual(self.get.call_count, 4)
+        self.assertEqual(self.post.call_count, 4)
+
+    def test_origin_lookup_failure_remains_fatal_for_open_destination(self):
+        self.mock_three_cities()
+        self.get.side_effect = None
+        self.get.return_value = http_response({"search_metadata": {"status": "Success"}})
+        result = build_proposal(self.open_request(), limits=SearchLimits(max_destinations=3, max_llm_calls=5))
+        self.assertIsInstance(result, PlanningError)
+        details = result.trace.events[-1].details
+        self.assertEqual(details["stage"], "location_resolution")
+        self.assertEqual(details["location_role"], "origin")
+        self.assertEqual(details["response_error_kind"], "missing_results")
+        self.get.assert_called_once()
+
+    def test_authentication_and_remote_quota_errors_remain_fatal_after_valid_offers(self):
+        for status in (401, 429):
+            with self.subTest(status=status):
+                self.get.reset_mock()
+                self.post.reset_mock()
+                self.mock_three_cities()
+                original = self.get.side_effect
+
+                def response(url, *, params, **kwargs):
+                    if params.get("q") == "Vienna, Austria":
+                        return http_response({}, status=status)
+                    return original(url, params=params, **kwargs)
+
+                self.get.side_effect = response
+                result = build_proposal(self.open_request(), limits=SearchLimits(
+                    max_destinations=3, max_serpapi_calls=13, max_llm_calls=5,
+                ))
+                self.assertIsInstance(result, PlanningError)
+                self.assertEqual(result.code, "FLIGHT_PROVIDER_ERROR")
+                self.assertIn(EventType.COMBINATION_ACCEPTED, [e.event_type for e in result.trace.events])
+                self.assertNotIn(EventType.PROPOSALS_SELECTED, [e.event_type for e in result.trace.events])
+                self.assertEqual(self.get.call_count, 6)
+                self.assertEqual(self.post.call_count, 3)
+
+    def test_call_limits_remain_fatal_after_a_destination_is_skipped(self):
+        for limits, service in (
+            (SearchLimits(max_destinations=3, max_serpapi_calls=6, max_llm_calls=5), "serpapi"),
+            (SearchLimits(max_destinations=3, max_serpapi_calls=13, max_llm_calls=3), "llm"),
+        ):
+            with self.subTest(service=service):
+                self.get.reset_mock()
+                self.post.reset_mock()
+                self.fail_middle_city("location_resolution")
+                result = build_proposal(self.open_request(), limits=limits)
+                self.assertIsInstance(result, PlanningError)
+                self.assertEqual(result.code, "SEARCH_LIMIT_REACHED")
+                self.assertEqual(result.trace.events[-1].details["service"], service)
+
+    def test_partial_search_and_summary_failure_have_independent_statuses(self):
+        self.fail_middle_city("location_resolution")
+        self.summary_content = "invalid JSON"
+        result = build_proposal(self.open_request(), limits=SearchLimits(
+            max_destinations=3, max_serpapi_calls=13, max_llm_calls=5,
+        ))
+        self.assertIsInstance(result, TripSearchResult)
+        self.assertEqual(result.search_status, "partial")
+        self.assertEqual(result.summary_status, "unavailable")
+        self.assertEqual(len(result.proposals), 2)
 
     def test_periods_are_ranked_and_deduplicated_before_the_cap(self):
         second, third = self.start + timedelta(days=7), self.start + timedelta(days=14)

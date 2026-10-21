@@ -77,7 +77,7 @@ class FinalProposalSelectionTest(unittest.TestCase):
         self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("Live HTTP disabled")))
         self.request = TripRequest(
             origin="Rome", budget_eur=900, budget_flexibility_pct=0,
-            destination_pref=DestinationPreference(mode="open"),
+            destination_pref=DestinationPreference(mode="fixed", destination="Paris"),
             time_pref=TimePreference(mode="exact_dates", start_date=date(2026, 12, 5), end_date=date(2026, 12, 10)),
         )
         self.paris = [
@@ -271,7 +271,8 @@ class FinalProposalSelectionTest(unittest.TestCase):
         other.flight.destination = "Lyon"
         other.flight.outbound.segments[-1].arrival_airport = "LYS"
         other.flight.inbound.segments[0].departure_airport = "LYS"
-        selected = select_final_proposals([self.tradeoffs[0], other], self.request)
+        request = self.request.model_copy(update={"destination_pref": DestinationPreference(mode="open")})
+        selected = select_final_proposals([self.tradeoffs[0], other], request)
         self.assertEqual(len(selected), 2)
         self.assert_selected_quote(selected[0], self.tradeoffs[0])
         self.assert_selected_quote(selected[1], other)

@@ -1,5 +1,6 @@
 from decimal import Decimal, InvalidOperation
 import re
+import unicodedata
 
 from execution import RunBudget
 
@@ -15,6 +16,10 @@ from providers.serpapi_client import SerpAPIResponseError, search as search_serp
 from providers.links import parse_redirect
 
 
+# The autocomplete's "airports" list also contains transport IDs such as 4GS.
+AUTOCOMPLETE_LOCATION_PATTERN = r"^[A-Z0-9]{3}$"
+
+
 class FlightLocationError(ValueError):
     def __init__(self, message: str, options: list[str] | None = None):
         super().__init__(message)
@@ -26,12 +31,12 @@ def _result_items(payload: dict, *keys: str) -> list[dict]:
         metadata = payload.get("search_metadata", {})
         if isinstance(metadata, dict) and metadata.get("status") == "Success" and payload.get("error"):
             return []
-        raise SerpAPIResponseError("La risposta non contiene i risultati attesi.")
+        raise SerpAPIResponseError("La risposta non contiene i risultati attesi.", kind="missing_results")
     items = []
     for key in keys:
         group = payload.get(key, [])
         if not isinstance(group, list) or any(not isinstance(item, dict) for item in group):
-            raise SerpAPIResponseError("Formato dei risultati SerpAPI inatteso.")
+            raise SerpAPIResponseError("Formato dei risultati SerpAPI inatteso.", kind="invalid_results")
         items.extend(group)
     return items
 
@@ -44,15 +49,15 @@ def _validate_city(city: dict) -> None:
         or not isinstance(city.get("id"), str)
         or not re.fullmatch(CITY_ID_PATTERN, city["id"])
     ):
-        raise SerpAPIResponseError("Identificativo o nome della citta non valido.")
+        raise SerpAPIResponseError("Identificativo o nome della citta non valido.", kind="invalid_city")
     airports = city.get("airports", [])
     if not isinstance(airports, list) or any(
         not isinstance(airport, dict)
         or not isinstance(airport.get("id"), str)
-        or not re.fullmatch(AIRPORT_CODE_PATTERN, airport["id"])
+        or not re.fullmatch(AUTOCOMPLETE_LOCATION_PATTERN, airport["id"])
         for airport in airports
     ):
-        raise SerpAPIResponseError("Elenco degli aeroporti non valido.")
+        raise SerpAPIResponseError("Elenco delle localita di trasporto non valido.", kind="invalid_city_locations")
 
 
 def find_city_options(text: str, *, budget: RunBudget | None = None) -> list[dict]:
@@ -75,15 +80,20 @@ def find_city_options(text: str, *, budget: RunBudget | None = None) -> list[dic
     return list(cities.values())
 
 
+def _normalized_location_name(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
+
+
 def resolve_city(text: str, *, city_id: str | None = None, budget: RunBudget | None = None) -> dict:
     cities = find_city_options(text, budget=budget)
-    normalized = " ".join(text.casefold().split())
+    normalized = _normalized_location_name(text)
     if city_id is not None:
         matches = [city for city in cities if city["id"] == city_id]
     else:
         matches = []
         for city in cities:
-            name = " ".join(city["name"].casefold().split())
+            name = _normalized_location_name(city["name"])
             if name == normalized or ("," not in normalized and name.split(",")[0] == normalized):
                 matches.append(city)
     if len(matches) != 1:
@@ -99,6 +109,8 @@ def search_id_for(city: dict, airport_code: str | None = None) -> str:
     if airport_code is None:
         return city["id"]
     code = airport_code.strip().upper()
+    if not re.fullmatch(AIRPORT_CODE_PATTERN, code):
+        raise FlightLocationError("Specifica un codice aeroportuale di tre lettere.")
     if code not in {airport["id"] for airport in city.get("airports", [])}:
         raise FlightLocationError("Aeroporto richiesto non verificato per questa citta.")
     return code
@@ -119,7 +131,7 @@ def parse_flight_leg(raw_leg: dict) -> FlightLeg:
         ]
         return FlightLeg(segments=segments, duration_minutes=raw_leg["total_duration"])
     except (KeyError, TypeError, ValueError):
-        raise SerpAPIResponseError("Segmenti o durata del volo non validi.") from None
+        raise SerpAPIResponseError("Segmenti o durata del volo non validi.", kind="invalid_flight_leg") from None
 
 
 def _validate_leg(leg: FlightLeg, query: FlightSearchQuery, *, returning: bool) -> None:
@@ -127,13 +139,13 @@ def _validate_leg(leg: FlightLeg, query: FlightSearchQuery, *, returning: bool) 
     origin_id = query.destination_id if returning else query.origin_id
     destination_id = query.origin_id if returning else query.destination_id
     if leg.segments[0].departure_local.date() != expected_date:
-        raise SerpAPIResponseError("Il volo non rispetta la data richiesta.")
+        raise SerpAPIResponseError("Il volo non rispetta la data richiesta.", kind="flight_date_mismatch")
     for location_id, airport in (
         (origin_id, leg.segments[0].departure_airport),
         (destination_id, leg.segments[-1].arrival_airport),
     ):
         if re.fullmatch(AIRPORT_CODE_PATTERN, location_id) and location_id != airport:
-            raise SerpAPIResponseError("Il volo non rispetta il vincolo aeroportuale.")
+            raise SerpAPIResponseError("Il volo non rispetta il vincolo aeroportuale.", kind="flight_airport_mismatch")
 
 
 def _select_outbounds(items: list[dict], query: FlightSearchQuery, limit: int) -> list[tuple[str, FlightLeg]]:
@@ -142,7 +154,7 @@ def _select_outbounds(items: list[dict], query: FlightSearchQuery, limit: int) -
     for item in items:
         token = item.get("departure_token")
         if not isinstance(token, str) or not token:
-            raise SerpAPIResponseError("Risultato senza departure_token utilizzabile.")
+            raise SerpAPIResponseError("Risultato senza departure_token utilizzabile.", kind="missing_departure_token")
         if token in tokens:
             continue
         tokens.add(token)
@@ -193,7 +205,7 @@ def search_flights(
                     redirect=redirect,
                 )
             except (KeyError, ValueError, InvalidOperation):
-                raise SerpAPIResponseError("Prezzo o dati dell'offerta A/R non validi.") from None
+                raise SerpAPIResponseError("Prezzo o dati dell'offerta A/R non validi.", kind="invalid_flight_offer") from None
             if query.max_price_eur is None or offer.price_eur <= query.max_price_eur:
                 offers.append(offer)
     return offers
