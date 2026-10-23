@@ -729,7 +729,7 @@ class WorkflowTest(unittest.TestCase):
         event = result.trace.events[-1]
         self.assertEqual(event.reason_code, expected_reason)
         expected_details = {
-            "agent": "destination", "serpapi_calls": 0, "llm_calls": 0,
+            "agent": "destination", "serpapi_calls": 0, "llm_calls": 0, "llm_retries": 0,
             **self.limits.model_dump(),
         }
         if expected_reason == ReasonCode.LLM_PROVIDER_ERROR:
@@ -1029,7 +1029,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(event.reason_code, ReasonCode.NO_FLIGHTS_FOUND)
         self.assertEqual(event.details, {
             "destination": "Kyoto", "start": "2026-09-15", "end": "2026-09-20",
-            "serpapi_calls": 0, "llm_calls": 0, **self.limits.model_dump(),
+            "serpapi_calls": 0, "llm_calls": 0, "llm_retries": 0, **self.limits.model_dump(),
         })
         hotels.assert_not_called()
 

@@ -28,6 +28,8 @@ class RunBudget:
     used: dict[str, int] = field(
         default_factory=lambda: {"serpapi": 0, "llm": 0}, init=False
     )
+    llm_retries: int = field(default=0, init=False)
+    llm_retry_details: dict[str, str | int | None] = field(default_factory=dict, init=False)
 
     def claim(self, service: Literal["serpapi", "llm"]) -> None:
         limit = {
@@ -38,3 +40,11 @@ class RunBudget:
             raise SearchLimitExceeded(service, self.used[service], limit)
         # Count attempts, including timeouts; a failed call is not refunded.
         self.used[service] += 1
+
+    def claim_llm_retry(self) -> bool:
+        # Reserve both the shared retry and its HTTP call before any backoff.
+        if self.llm_retries or self.used["llm"] >= self.limits.max_llm_calls:
+            return False
+        self.claim("llm")
+        self.llm_retries += 1
+        return True

@@ -82,6 +82,21 @@ class RunBudgetTest(unittest.TestCase):
         self.assertEqual(second.used, {"serpapi": 0, "llm": 0})
         self.assertIsNot(first.used, second.used)
 
+    def test_shared_retry_reserves_one_call_and_cannot_exceed_either_limit(self):
+        first = RunBudget(SearchLimits(max_llm_calls=3))
+        first.claim("llm")
+        self.assertTrue(first.claim_llm_retry())
+        self.assertEqual(first.used["llm"], 2)
+        self.assertEqual(first.llm_retries, 1)
+        self.assertFalse(first.claim_llm_retry())
+        self.assertEqual(first.used["llm"], 2)
+        exhausted = RunBudget(SearchLimits(max_llm_calls=1))
+        exhausted.claim("llm")
+        self.assertFalse(exhausted.claim_llm_retry())
+        self.assertEqual(exhausted.used["llm"], 1)
+        self.assertEqual(exhausted.llm_retries, 0)
+        self.assertEqual(RunBudget(first.limits).llm_retries, 0)
+
 
 class HTTPBudgetTest(unittest.TestCase):
     def setUp(self):
@@ -164,6 +179,7 @@ class PlannerLimitsTest(unittest.TestCase):
         }))
         self.get = self.enterContext(patch("providers.serpapi_client.requests.get", side_effect=self.serpapi_response))
         self.post = self.enterContext(patch("llm.openrouter.requests.post", side_effect=self.llm_response))
+        self.sleep = self.enterContext(patch("llm.openrouter.time.sleep"))
         self.start = date(2027, 5, 10)
         self.end = self.start + timedelta(days=5)
         self.periods = [self.period(self.start, 80)]
@@ -380,6 +396,85 @@ class PlannerLimitsTest(unittest.TestCase):
         self.assertEqual(event.details["serpapi_calls"], 13)
         self.assertEqual(event.details["llm_calls"], 5)
 
+    def test_three_city_pipeline_can_recover_a_502_in_any_llm_stage(self):
+        for stage in ("destination_advice", "travel_window_advice", "proposal_summaries"):
+            with self.subTest(stage=stage):
+                self.mock_three_cities()
+                self.get.reset_mock()
+                self.post.reset_mock()
+                self.sleep.reset_mock()
+                failed = False
+
+                def response(url, **kwargs):
+                    nonlocal failed
+                    name = kwargs["json"]["response_format"]["json_schema"]["name"]
+                    if name == stage and not failed:
+                        failed = True
+                        return http_response({"error": {"code": 502, "message": "PRIVATE-KEY"}}, 502)
+                    return self.llm_response(url, **kwargs)
+
+                self.post.side_effect = response
+                result = build_proposal(self.open_request(), limits=SearchLimits(
+                    max_destinations=3, max_serpapi_calls=13, max_llm_calls=6,
+                ))
+                self.assertIsInstance(result, TripSearchResult)
+                self.assertEqual([p.destination.name for p in result.proposals], ["Lisbon", "Vienna", "Paris"])
+                self.assertEqual(result.summary_status, "generated")
+                self.assertEqual(self.get.call_count, 13)
+                self.assertEqual(self.post.call_count, 6)
+                self.sleep.assert_called_once_with(1.0)
+                details = result.trace.events[-1].details
+                self.assertEqual(details["llm_calls"], 6)
+                self.assertEqual(details["llm_retries"], 1)
+                self.assertEqual(details["llm_retry_error_kind"], "provider_unavailable")
+                self.assertEqual(details["llm_retry_http_status"], 502)
+                self.assertEqual(details["llm_retry_api_code"], 502)
+                self.assertNotIn("PRIVATE-KEY", result.model_dump_json())
+                self.assertEqual(TripSearchResult.model_validate_json(result.model_dump_json()), result)
+
+    def test_retry_used_by_destination_agent_is_not_available_to_travel_window(self):
+        failed = False
+
+        def response(url, **kwargs):
+            nonlocal failed
+            name = kwargs["json"]["response_format"]["json_schema"]["name"]
+            if name == "destination_advice" and not failed:
+                failed = True
+                return http_response({"error": {"code": 502}}, 502)
+            if name == "travel_window_advice":
+                return http_response({"error": {"code": 503}}, 503)
+            return self.llm_response(url, **kwargs)
+
+        self.post.side_effect = response
+        result = build_proposal(self.open_request(), limits=SearchLimits(max_llm_calls=10))
+        self.assertIsInstance(result, PlanningError)
+        self.assertEqual(result.code, ReasonCode.LLM_PROVIDER_ERROR)
+        details = result.trace.events[-1].details
+        self.assertEqual(details["llm_calls"], 3)
+        self.assertEqual(details["llm_retries"], 1)
+        self.assertEqual(details["llm_http_status"], 503)
+        self.assertEqual(details["llm_retry_http_status"], 502)
+        self.assertEqual(self.post.call_count, 3)
+        self.get.assert_not_called()
+        self.sleep.assert_called_once()
+
+    def test_retry_does_not_increase_default_limits_or_discard_offers_if_summary_has_no_room(self):
+        failed = False
+
+        def response(url, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                return http_response({"error": {"code": 502}}, 502)
+            return self.llm_response(url, **kwargs)
+
+        self.post.side_effect = response
+        result = build_proposal(self.request, limits=SearchLimits())
+        self.assert_summary_unavailable(result, ReasonCode.SEARCH_LIMIT_REACHED)
+        self.assertEqual(result.trace.events[-1].details["max_llm_calls"], 2)
+        self.assertEqual(result.trace.events[-1].details["llm_retries"], 1)
+        self.sleep.assert_called_once()
+
     def test_city_diversity_never_bypasses_budget_or_forces_three_results(self):
         self.mock_three_cities()
         request = self.open_request().model_copy(update={"budget_eur": 450, "budget_flexibility_pct": 0})
@@ -594,7 +689,8 @@ class PlannerLimitsTest(unittest.TestCase):
         self.post.side_effect = Timeout("test timeout")
         result = build_proposal(self.request, limits=SearchLimits())
         self.assertEqual(result.code, "LLM_PROVIDER_ERROR")
-        self.assertEqual(result.trace.events[-1].details["llm_calls"], 1)
+        self.assertEqual(result.trace.events[-1].details["llm_calls"], 2)
+        self.assertEqual(result.trace.events[-1].details["llm_retries"], 1)
         self.assertEqual(result.trace.events[-1].details["serpapi_calls"], 0)
         self.get.assert_not_called()
 

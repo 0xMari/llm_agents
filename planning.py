@@ -152,6 +152,8 @@ def build_proposal(request: TripRequest, *, limits: SearchLimits) -> TripSearchR
     result.trace.events[-1].details.update(
         serpapi_calls=budget.used["serpapi"],
         llm_calls=budget.used["llm"],
+        llm_retries=budget.llm_retries,
+        **budget.llm_retry_details,
         **limits.model_dump(),
     )
     return result
