@@ -44,7 +44,7 @@ def fake_travel_window_response(
     start="2026-09-15",
     end="2026-09-20",
     score=90,
-    rationale="Settembre è una buona finestra di viaggio.",
+    rationale="September is a suitable travel window.",
 ):
     return json.dumps(
         {
@@ -52,7 +52,7 @@ def fake_travel_window_response(
                 {
                     "start": start,
                     "end": end,
-                    "reason": "Periodo adatto per clima e vibe.",
+                    "reason": "A suitable period for the climate and vacation vibe.",
                     "score": score,
                 }
             ],
@@ -101,7 +101,7 @@ class WorkflowTest(unittest.TestCase):
         destination = SuggestedDestination(
             name="Lisbon",
             country="Portugal",
-            reason="Destinazione simulata per verificare il workflow.",
+            reason="Sample destination for workflow tests.",
             match_score=70,
         )
 
@@ -114,6 +114,36 @@ class WorkflowTest(unittest.TestCase):
     def build_proposal(self, request):
         # These tests exercise multiple candidates; smoke-test defaults are narrower.
         return build_proposal(request, limits=self.limits)
+
+    def test_all_agents_request_english_output_without_rewriting_the_user_vibe(self):
+        request = self.flight_request(
+            destination_pref=DestinationPreference(mode="open"),
+            vibe=TravelVibe(
+                free_text="Vorrei visitare musei e provare la cucina locale senza fretta.",
+                themes=["museums", "food"], pace="slow",
+            ),
+        )
+        original = request.model_dump_json()
+        result = self.build_proposal(request)
+        self.assertNotIsInstance(result, PlanningError)
+        self.assertEqual(result.summary_status, "generated")
+        self.assertEqual(request.model_dump_json(), original)
+        for call, instruction in (
+            (self.fake_destination_call, "all generated text in English"),
+            (self.fake_openrouter_call, "all generated text in English"),
+            (self.fake_summary_call, "natural, consistent English"),
+        ):
+            with self.subTest(instruction=instruction):
+                call.assert_called_once()
+                messages = call.call_args.kwargs["messages"]
+                self.assertIn(instruction, messages[0]["content"])
+                self.assertNotIn(request.vibe.free_text, messages[0]["content"])
+                payload = json.loads(messages[1]["content"])
+                vibe = payload.get("vibe", payload.get("request", {}).get("vibe"))
+                self.assertEqual(vibe, request.vibe.model_dump(mode="json"))
+        self.assertEqual(result.proposals[0].summary.title, "Travel proposal")
+        self.assertIn("Explore local markets and restaurants.", result.proposals[0].recommendations)
+        self.assertIn("Candidate destinations resolved.", [event.comment for event in result.trace.events])
 
     def test_proposal_respects_budget(self):
         request = TripRequest(
@@ -993,7 +1023,7 @@ class WorkflowTest(unittest.TestCase):
 
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.NO_FLIGHTS_FOUND.value)
-        self.assertIn("Nessun volo", result.message)
+        self.assertIn("No flights", result.message)
         event = result.trace.events[-1]
         self.assertEqual(event.event_type, EventType.SEARCH_FAILED)
         self.assertEqual(event.reason_code, ReasonCode.NO_FLIGHTS_FOUND)
@@ -1015,7 +1045,7 @@ class WorkflowTest(unittest.TestCase):
 
         self.assertIsInstance(result, PlanningError)
         self.assertEqual(result.code, ReasonCode.NO_HOTELS_FOUND.value)
-        self.assertIn("Nessun hotel", result.message)
+        self.assertIn("No hotels", result.message)
         failures = [
             event for event in result.trace.events
             if event.event_type == EventType.SEARCH_FAILED
@@ -1043,7 +1073,7 @@ class WorkflowTest(unittest.TestCase):
 
                 self.assertIsInstance(result, PlanningError)
                 self.assertEqual(result.code, ReasonCode.NO_AFFORDABLE_PROPOSAL.value)
-                self.assertIn("budget massimo", result.message)
+                self.assertIn("maximum allowed budget", result.message)
                 reasons = [event.reason_code for event in result.trace.events]
                 self.assertIn(ReasonCode.OVER_MAX_BUDGET, reasons)
                 self.assertNotIn(ReasonCode.NO_FLIGHTS_FOUND, reasons)
@@ -1639,7 +1669,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(advice.selected_periods[0].end, date(2026, 9, 20))
 
         self.fake_openrouter_call.return_value = fake_travel_window_response(end="2026-09-21")
-        with self.assertRaisesRegex(ValueError, "durata massima"):
+        with self.assertRaisesRegex(ValueError, "maximum trip duration"):
             evaluate_travel_window(request, destination)
 
 
@@ -2057,7 +2087,7 @@ class HotelOfferTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 raw_hotel = {key: value for key, value in self.raw_hotel.items() if key != "total_rate"}
                 raw_hotel.update(fields)
-                with self.assertRaisesRegex(SerpAPIResponseError, "prezzo totale"):
+                with self.assertRaisesRegex(SerpAPIResponseError, "total price"):
                     parse_hotel_offer(raw_hotel, self.query)
 
     def test_parser_rejects_negative_or_nonfinite_prices(self):

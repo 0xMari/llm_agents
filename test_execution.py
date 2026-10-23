@@ -359,6 +359,12 @@ class PlannerLimitsTest(unittest.TestCase):
         self.assertEqual(result.summary_status, "generated")
         self.assertEqual(self.get.call_count, 13)
         self.assertEqual(self.post.call_count, 5)
+        for call in self.get.call_args_list:
+            params = call.kwargs["params"]
+            self.assertEqual(params["hl"], "en")
+            self.assertEqual(params["gl"], "it")
+            if params["engine"] != "google_flights_autocomplete":
+                self.assertEqual(params["currency"], "EUR")
         self.assertEqual(TripSearchResult.model_validate_json(result.model_dump_json()), result)
         self.assertEqual(
             [call.kwargs["json"]["response_format"]["json_schema"]["name"] for call in self.post.call_args_list],
@@ -678,6 +684,30 @@ class PlannerLimitsTest(unittest.TestCase):
         )
         self.assertEqual(success.summary_status, "generated")
         self.assertEqual(failure.summary_status, "unavailable")
+
+    def test_summary_quality_failure_preserves_facts_and_reports_safe_reason_without_retry(self):
+        success = build_proposal(self.request, limits=SearchLimits())
+        for text, kind in (
+            ("PRIVATE unverified details and", "incomplete_text"),
+            ("PRIVATE suitability not_verified.", "internal_reference"),
+            ("PRIVATE museums in the\u4e2d\u5fc3.", "unexpected_script"),
+        ):
+            with self.subTest(kind=kind):
+                self.get.reset_mock()
+                self.post.reset_mock()
+                self.summary_content = json.dumps({"items": [
+                    {**p.summary.model_dump(), "advantage": text}
+                    for p in success.proposals
+                ]})
+                result = build_proposal(self.request, limits=SearchLimits())
+                failure = self.assert_summary_unavailable(result, ReasonCode.LLM_CONSTRAINT_VIOLATION)
+                self.assertEqual(failure.details["summary_quality_issue"], kind)
+                self.assertEqual(failure.details["summary_field"], "advantage")
+                self.assertNotIn("PRIVATE", result.model_dump_json())
+                self.assertEqual(
+                    [p.model_dump(exclude={"summary"}) for p in success.proposals],
+                    [p.model_dump(exclude={"summary"}) for p in result.proposals],
+                )
 
     def test_no_summary_attempt_without_selected_offers(self):
         self.no_flights = True

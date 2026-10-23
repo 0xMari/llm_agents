@@ -81,7 +81,7 @@ class HotelProviderTest(unittest.TestCase):
         self.api.assert_called_once_with({
             "engine": "google_hotels", "q": "Hotels in Lisbon, Portugal",
             "check_in_date": "2026-09-15", "check_out_date": "2026-09-20",
-            "adults": 2, "currency": "EUR", "hl": "it", "gl": "it",
+            "adults": 2, "currency": "EUR", "hl": "en", "gl": "it",
         }, budget=None)
         self.assertEqual(len(hotels), 1)
         self.assertEqual(hotels[0].destination, "Lisbon")
@@ -188,7 +188,7 @@ class HotelProviderTest(unittest.TestCase):
     def test_public_website_has_explicit_redirect_kind(self):
         hotel = search_hotels(self.query)[0]
         self.assertEqual(hotel.redirect.kind, "property_website")
-        self.assertEqual(hotel.redirect.label, "Apri la pagina dell'alloggio")
+        self.assertEqual(hotel.redirect.label, "Open property page")
         self.assertEqual(hotel.model_dump(mode="json")["redirect"]["url"], "https://hotel.example/stay")
 
     def test_api_links_and_rpc_metadata_are_not_used_as_redirects(self):
@@ -356,7 +356,7 @@ class HotelProviderTest(unittest.TestCase):
         }
         hotel = search_hotels(self.query)[0]
         self.assertEqual(hotel.search_redirect.kind, "hotel_search")
-        self.assertEqual(hotel.search_redirect.label, "Apri la ricerca hotel")
+        self.assertEqual(hotel.search_redirect.label, "Open hotel search")
         self.assertEqual(str(hotel.search_redirect.url), "https://www.google.com/travel/hotels?q=Lisbon")
         self.assertEqual(str(hotel.redirect.url), "https://hotel.example/stay")
         self.api.assert_called_once()
@@ -413,7 +413,7 @@ class RecordedHotelFixtureTest(unittest.TestCase):
                         "check_in_date": query.checkin_date.isoformat(),
                         "check_out_date": query.checkout_date.isoformat(),
                         "adults": query.adults,
-                        "currency": "EUR", "hl": "it", "gl": "it",
+                        "currency": "EUR", "hl": "en", "gl": "it",
                     }, budget=None)
                     self.assertEqual(len(offers), len(raw_hotels))
                     for offer, raw in zip(offers, raw_hotels):
@@ -449,7 +449,7 @@ class RedirectTest(unittest.TestCase):
             with self.subTest(url=url):
                 redirect = parse_redirect(url, kind="search")
                 self.assertEqual(redirect.kind, "search")
-                self.assertEqual(redirect.label, "Apri la ricerca voli")
+                self.assertEqual(redirect.label, "Open flight search")
         for url in (
             "https://not-google.example/travel/flights", "https://www.google.com/",
             "https://www.google.com.evil.example/travel/flights", "https://www.google.com/flights/unsupported",
@@ -466,7 +466,7 @@ class RedirectTest(unittest.TestCase):
             with self.subTest(url=url):
                 redirect = parse_redirect(url, kind="hotel_search")
                 self.assertEqual(redirect.kind, "hotel_search")
-                self.assertEqual(redirect.label, "Apri la ricerca hotel")
+                self.assertEqual(redirect.label, "Open hotel search")
                 self.assertIsNone(parse_redirect(url, kind="search"))
         for url in (
             "https://www.google.com/travel/flights", "https://www.google.com/",
@@ -479,7 +479,7 @@ class RedirectTest(unittest.TestCase):
 
     def test_property_link_label_does_not_promise_the_official_site_or_quoted_rate(self):
         redirect = parse_redirect("https://travel-provider.example/hotel", kind="property_website")
-        self.assertEqual(redirect.label, "Apri la pagina dell'alloggio")
+        self.assertEqual(redirect.label, "Open property page")
 
 
 if __name__ == "__main__":

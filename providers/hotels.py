@@ -72,13 +72,13 @@ def parse_hotel_offer(
     raw_hotel: dict, query: HotelSearchQuery, *, search_url: object = None
 ) -> HotelOffer:
     if not isinstance(raw_hotel, dict):
-        raise SerpAPIResponseError("Formato dell'hotel non valido.")
+        raise SerpAPIResponseError("Invalid hotel format.")
     total_rate = raw_hotel.get("total_rate")
     if not isinstance(total_rate, dict) or total_rate.get("extracted_lowest") is None:
-        raise SerpAPIResponseError("L'hotel non contiene un prezzo totale utilizzabile.")
+        raise SerpAPIResponseError("The hotel has no usable total price.")
     nightly_rate = raw_hotel.get("rate_per_night")
     if nightly_rate is not None and not isinstance(nightly_rate, dict):
-        raise SerpAPIResponseError("Formato del prezzo per notte non valido.")
+        raise SerpAPIResponseError("Invalid nightly price format.")
     nightly_price = nightly_rate.get("extracted_lowest") if nightly_rate else None
     try:
         return HotelOffer(
@@ -94,7 +94,7 @@ def parse_hotel_offer(
             details=_parse_details(raw_hotel),
         )
     except (KeyError, AttributeError, TypeError, ValueError, InvalidOperation):
-        raise SerpAPIResponseError("Prezzi o dati dell'offerta hotel non validi.") from None
+        raise SerpAPIResponseError("Invalid hotel offer prices or data.") from None
 
 
 def search_hotels(query: HotelSearchQuery, *, budget: RunBudget | None = None) -> list[HotelOffer]:
@@ -105,7 +105,7 @@ def search_hotels(query: HotelSearchQuery, *, budget: RunBudget | None = None) -
         "check_in_date": query.checkin_date.isoformat(),
         "check_out_date": query.checkout_date.isoformat(),
         "adults": query.adults,
-        "currency": "EUR", "hl": "it", "gl": "it",
+        "currency": "EUR", "hl": "en", "gl": "it",
     }, budget=budget)
     metadata = response.get("search_metadata")
     search_url = metadata.get("google_hotels_url") if isinstance(metadata, dict) else None
@@ -119,7 +119,7 @@ def _hotel_results(response: dict) -> list[dict]:
     if "properties" in response:
         items = response["properties"]
         if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
-            raise SerpAPIResponseError("Formato dei risultati hotel inatteso.")
+            raise SerpAPIResponseError("Unexpected hotel result format.")
         return items
     information = response.get("search_information")
     if isinstance(information, dict) and information.get("hotels_results_state") == "Showing results for property details":
@@ -127,4 +127,4 @@ def _hotel_results(response: dict) -> list[dict]:
     metadata = response.get("search_metadata", {})
     if isinstance(metadata, dict) and metadata.get("status") == "Success" and response.get("error"):
         return []
-    raise SerpAPIResponseError("La risposta non contiene i risultati hotel attesi.")
+    raise SerpAPIResponseError("The response does not contain the expected hotel results.")

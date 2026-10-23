@@ -30,7 +30,7 @@ class SerpAPIResponseError(SerpAPIError):
 def search(params, *, budget: RunBudget | None = None):
     api_key = os.environ.get("SERPAPI_API_KEY")
     if not api_key:
-        raise SerpAPIError("Configura SERPAPI_API_KEY prima di eseguire la ricerca.", code="CONFIGURATION")
+        raise SerpAPIError("Configure SERPAPI_API_KEY before searching.", code="CONFIGURATION")
     if budget is not None:
         budget.claim("serpapi")
     try:
@@ -45,23 +45,23 @@ def search(params, *, budget: RunBudget | None = None):
             )
             raise SerpAPIError(f"SerpAPI HTTP {response.status_code}", code=code, status_code=response.status_code)
     except requests.Timeout:
-        raise SerpAPIError("Timeout durante la ricerca SerpAPI.", code="TIMEOUT") from None
+        raise SerpAPIError("The SerpAPI search timed out.", code="TIMEOUT") from None
     except requests.RequestException:
-        raise SerpAPIError("Errore di rete durante la ricerca SerpAPI.", code="NETWORK_ERROR") from None
+        raise SerpAPIError("Network error during the SerpAPI search.", code="NETWORK_ERROR") from None
     try:
         data = response.json()
     except ValueError:
-        raise SerpAPIResponseError("Risposta JSON non valida.", kind="invalid_json") from None
+        raise SerpAPIResponseError("Invalid JSON response.", kind="invalid_json") from None
     if not isinstance(data, dict):
-        raise SerpAPIResponseError("Formato della risposta inatteso.", kind="invalid_payload")
+        raise SerpAPIResponseError("Unexpected response format.", kind="invalid_payload")
     metadata = data.get("search_metadata")
     if not isinstance(metadata, dict):
-        raise SerpAPIResponseError("Metadati della ricerca mancanti o invalidi.", kind="invalid_metadata")
+        raise SerpAPIResponseError("Missing or invalid search metadata.", kind="invalid_metadata")
     status = metadata.get("status")
     if status == "Error":
-        raise SerpAPIError("Ricerca SerpAPI non completata correttamente.", code="SEARCH_ERROR")
+        raise SerpAPIError("The SerpAPI search failed.", code="SEARCH_ERROR")
     if status in ("Processing", "Queued"):
-        raise SerpAPIError("Ricerca SerpAPI non ancora completata.", code="SEARCH_PENDING")
+        raise SerpAPIError("The SerpAPI search has not completed yet.", code="SEARCH_PENDING")
     if status != "Success":
-        raise SerpAPIResponseError("Stato della ricerca mancante o non valido.", kind="invalid_status")
+        raise SerpAPIResponseError("Missing or invalid search status.", kind="invalid_status")
     return data

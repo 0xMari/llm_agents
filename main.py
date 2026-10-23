@@ -32,4 +32,4 @@ if __name__ == "__main__":
         result = build_proposal(request, limits=SearchLimits())
         print(result.model_dump_json(indent=2))
     except ValueError as error:
-        print(f"Impossibile creare una proposta: {error}")
+        print(f"Unable to create a proposal: {error}")

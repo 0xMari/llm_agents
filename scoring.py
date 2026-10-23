@@ -92,7 +92,7 @@ def select_final_proposals(
 ) -> list[TripProposal]:
     """Select city alternatives or flight tradeoffs from planner-filtered quotes."""
     if type(early_hour) is not int or not 0 <= early_hour <= 23:
-        raise ValueError("early_hour deve essere un intero tra 0 e 23.")
+        raise ValueError("early_hour must be an integer between 0 and 23.")
     if not proposals:
         return []
 

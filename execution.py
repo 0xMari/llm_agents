@@ -19,7 +19,7 @@ class SearchLimitExceeded(RuntimeError):
         self.service = service
         self.used = used
         self.limit = limit
-        super().__init__(f"Limite {service} raggiunto: {used}/{limit}")
+        super().__init__(f"{service} call limit reached: {used}/{limit}")
 
 
 @dataclass

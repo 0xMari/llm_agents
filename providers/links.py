@@ -45,9 +45,9 @@ def parse_redirect(
         ):
             return None
     labels = {
-        "search": "Apri la ricerca voli",
-        "property_website": "Apri la pagina dell'alloggio",
-        "hotel_search": "Apri la ricerca hotel",
+        "search": "Open flight search",
+        "property_website": "Open property page",
+        "hotel_search": "Open hotel search",
     }
     return OfferRedirect(
         url=url,

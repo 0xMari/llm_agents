@@ -31,12 +31,12 @@ def _result_items(payload: dict, *keys: str) -> list[dict]:
         metadata = payload.get("search_metadata", {})
         if isinstance(metadata, dict) and metadata.get("status") == "Success" and payload.get("error"):
             return []
-        raise SerpAPIResponseError("La risposta non contiene i risultati attesi.", kind="missing_results")
+        raise SerpAPIResponseError("The response does not contain the expected results.", kind="missing_results")
     items = []
     for key in keys:
         group = payload.get(key, [])
         if not isinstance(group, list) or any(not isinstance(item, dict) for item in group):
-            raise SerpAPIResponseError("Formato dei risultati SerpAPI inatteso.", kind="invalid_results")
+            raise SerpAPIResponseError("Unexpected SerpAPI result format.", kind="invalid_results")
         items.extend(group)
     return items
 
@@ -49,7 +49,7 @@ def _validate_city(city: dict) -> None:
         or not isinstance(city.get("id"), str)
         or not re.fullmatch(CITY_ID_PATTERN, city["id"])
     ):
-        raise SerpAPIResponseError("Identificativo o nome della citta non valido.", kind="invalid_city")
+        raise SerpAPIResponseError("Invalid city identifier or name.", kind="invalid_city")
     airports = city.get("airports", [])
     if not isinstance(airports, list) or any(
         not isinstance(airport, dict)
@@ -57,12 +57,12 @@ def _validate_city(city: dict) -> None:
         or not re.fullmatch(AUTOCOMPLETE_LOCATION_PATTERN, airport["id"])
         for airport in airports
     ):
-        raise SerpAPIResponseError("Elenco delle localita di trasporto non valido.", kind="invalid_city_locations")
+        raise SerpAPIResponseError("Invalid list of transport locations.", kind="invalid_city_locations")
 
 
 def find_city_options(text: str, *, budget: RunBudget | None = None) -> list[dict]:
     if not text.strip():
-        raise FlightLocationError("Specifica una citta da cercare.")
+        raise FlightLocationError("Specify a city to search for.")
     response = search_serpapi({
         "engine": "google_flights_autocomplete",
         "q": text,
@@ -128,7 +128,7 @@ def select_city_candidate(
     if len(matches) != 1:
         text = ", ".join(filter(None, [name, country]))
         raise FlightLocationError(
-            f"Localita non risolta: {text!r}. Specifica la citta e il paese oppure scegli un city_id verificato.",
+            f"Location unresolved: {text!r}. Specify the city and country or select a verified city_id.",
             options=[f"{city['name']} ({city['id']})" for city in cities],
         )
     return matches[0]
@@ -142,7 +142,7 @@ def resolve_city(
     if country is not None:
         country = country.strip()
         if not country:
-            raise FlightLocationError("Il paese non puo essere vuoto.")
+            raise FlightLocationError("The country cannot be empty.")
         prefix, separator, suffix = name.rpartition(",")
         if separator and _normalized_location_name(suffix) == _normalized_location_name(country):
             name = prefix.strip()
@@ -158,9 +158,9 @@ def search_id_for(city: dict, airport_code: str | None = None) -> str:
         return city["id"]
     code = airport_code.strip().upper()
     if not re.fullmatch(AIRPORT_CODE_PATTERN, code):
-        raise FlightLocationError("Specifica un codice aeroportuale di tre lettere.")
+        raise FlightLocationError("Specify a three-letter airport code.")
     if code not in {airport["id"] for airport in city.get("airports", [])}:
-        raise FlightLocationError("Aeroporto richiesto non verificato per questa citta.")
+        raise FlightLocationError("The requested airport has not been verified for this city.")
     return code
 
 
@@ -179,7 +179,7 @@ def parse_flight_leg(raw_leg: dict) -> FlightLeg:
         ]
         return FlightLeg(segments=segments, duration_minutes=raw_leg["total_duration"])
     except (KeyError, TypeError, ValueError):
-        raise SerpAPIResponseError("Segmenti o durata del volo non validi.", kind="invalid_flight_leg") from None
+        raise SerpAPIResponseError("Invalid flight segments or duration.", kind="invalid_flight_leg") from None
 
 
 def _validate_leg(leg: FlightLeg, query: FlightSearchQuery, *, returning: bool) -> None:
@@ -187,13 +187,13 @@ def _validate_leg(leg: FlightLeg, query: FlightSearchQuery, *, returning: bool) 
     origin_id = query.destination_id if returning else query.origin_id
     destination_id = query.origin_id if returning else query.destination_id
     if leg.segments[0].departure_local.date() != expected_date:
-        raise SerpAPIResponseError("Il volo non rispetta la data richiesta.", kind="flight_date_mismatch")
+        raise SerpAPIResponseError("The flight does not match the requested date.", kind="flight_date_mismatch")
     for location_id, airport in (
         (origin_id, leg.segments[0].departure_airport),
         (destination_id, leg.segments[-1].arrival_airport),
     ):
         if re.fullmatch(AIRPORT_CODE_PATTERN, location_id) and location_id != airport:
-            raise SerpAPIResponseError("Il volo non rispetta il vincolo aeroportuale.", kind="flight_airport_mismatch")
+            raise SerpAPIResponseError("The flight does not match the airport constraint.", kind="flight_airport_mismatch")
 
 
 def _select_outbounds(items: list[dict], query: FlightSearchQuery, limit: int) -> list[tuple[str, FlightLeg]]:
@@ -202,7 +202,7 @@ def _select_outbounds(items: list[dict], query: FlightSearchQuery, limit: int) -
     for item in items:
         token = item.get("departure_token")
         if not isinstance(token, str) or not token:
-            raise SerpAPIResponseError("Risultato senza departure_token utilizzabile.", kind="missing_departure_token")
+            raise SerpAPIResponseError("The result has no usable departure_token.", kind="missing_departure_token")
         if token in tokens:
             continue
         tokens.add(token)
@@ -219,10 +219,10 @@ def search_flights(
     query: FlightSearchQuery, *, max_outbound: int = 3, budget: RunBudget | None = None,
 ) -> list[FlightOffer]:
     if type(max_outbound) is not int or max_outbound < 1:
-        raise ValueError("max_outbound deve essere un intero positivo.")
+        raise ValueError("max_outbound must be a positive integer.")
     params = {
         "engine": "google_flights", "type": 1, "currency": "EUR",
-        "adults": query.adults, "hl": "it", "gl": "it",
+        "adults": query.adults, "hl": "en", "gl": "it",
         "departure_id": query.origin_id, "arrival_id": query.destination_id,
         "outbound_date": query.departure_date.isoformat(),
         "return_date": query.return_date.isoformat(),
@@ -253,7 +253,7 @@ def search_flights(
                     redirect=redirect,
                 )
             except (KeyError, ValueError, InvalidOperation):
-                raise SerpAPIResponseError("Prezzo o dati dell'offerta A/R non validi.", kind="invalid_flight_offer") from None
+                raise SerpAPIResponseError("Invalid round-trip offer price or data.", kind="invalid_flight_offer") from None
             if query.max_price_eur is None or offer.price_eur <= query.max_price_eur:
                 offers.append(offer)
     return offers

@@ -22,8 +22,8 @@ def fake_summary_response(messages, **kwargs):
     return json.dumps({"items": [
         {
             "proposal_id": proposal["proposal_id"],
-            "title": f"Proposta {proposal['proposal_id']}",
-            "advantage": "Descrizione simulata per il test.",
+            "title": "Travel proposal",
+            "advantage": "Sample description for the test.",
             "tradeoff": None,
         }
         for proposal in payload["proposals"]
@@ -46,7 +46,7 @@ class ProposalSummaryTest(unittest.TestCase):
 
     def response(self):
         return {"items": [
-            {"proposal_id": p.comparison.proposal_id, "title": f"Titolo {i}", "advantage": "Vantaggio", "tradeoff": None}
+            {"proposal_id": p.comparison.proposal_id, "title": f"Title {i}", "advantage": "Main advantage.", "tradeoff": None}
             for i, p in enumerate(self.proposals)
         ]}
 
@@ -75,7 +75,7 @@ class ProposalSummaryTest(unittest.TestCase):
         payload["items"].reverse()
         self.set_response(payload)
         result = summarize_proposals(self.request, self.proposals)
-        self.assertEqual([p.summary.title for p in result], ["Titolo 0", "Titolo 1", "Titolo 2"])
+        self.assertEqual([p.summary.title for p in result], ["Title 0", "Title 1", "Title 2"])
         self.assertEqual([p.comparison.proposal_id for p in result], ["p1", "p2", "p3"])
 
     def test_missing_duplicate_and_unknown_ids_are_rejected_atomically(self):
@@ -94,6 +94,91 @@ class ProposalSummaryTest(unittest.TestCase):
         self.call.return_value = "not JSON"
         with self.assertRaises(ValidationError):
             summarize_proposals(self.request, self.proposals)
+
+    def test_incomplete_text_is_rejected_in_every_visible_field(self):
+        before = [p.model_dump_json() for p in self.proposals]
+        for field, text in (
+            ("title", "Museums and..."), ("title", "A proposal:"),
+            ("advantage", "Direct flight and a hotel near the"),
+            ("advantage", "Direct flight and hotel included..."),
+            ("advantage", "Direct flight and hotel included\u2026"),
+            ("tradeoff", "Costs more and"),
+            ("tradeoff", "Basic accommodation;"),
+            ("tradeoff", "High season with potentially large crowds and"),
+        ):
+            with self.subTest(field=field, text=text):
+                payload = self.response()
+                payload["items"][-1][field] = text
+                self.set_response(payload)
+                self.call.reset_mock()
+                with self.assertRaises(InvalidProposalSummary) as caught:
+                    summarize_proposals(self.request, self.proposals)
+                self.assertEqual(caught.exception.kind, "incomplete_text")
+                self.assertEqual(caught.exception.field, field)
+                self.call.assert_called_once()
+                self.assertEqual([p.model_dump_json() for p in self.proposals], before)
+
+    def test_internal_ids_and_enum_labels_are_rejected_only_in_visible_text(self):
+        for field, text in (
+            ("title", "Alternative to p1"),
+            ("advantage", "Costs less than P2."),
+            ("tradeoff", "Suitability not_verified."),
+            ("tradeoff", "Check reference_id and selection_profiles."),
+        ):
+            with self.subTest(field=field, text=text):
+                payload = self.response()
+                payload["items"][0][field] = text
+                self.set_response(payload)
+                with self.assertRaises(InvalidProposalSummary) as caught:
+                    summarize_proposals(self.request, self.proposals)
+                self.assertEqual(caught.exception.kind, "internal_reference")
+                self.assertEqual(caught.exception.field, field)
+
+    def test_unexpected_script_is_rejected(self):
+        for text, kind in (
+            ("Museums and walks in the\u4e2d\u5fc3.", "unexpected_script"),
+            ("\u0423\u0434\u043e\u0431\u043d\u044b\u0439 \u043e\u0442\u0435\u043b\u044c.", "unexpected_script"),
+        ):
+            with self.subTest(text=text):
+                payload = self.response()
+                payload["items"][0]["advantage"] = text
+                self.set_response(payload)
+                with self.assertRaises(InvalidProposalSummary) as caught:
+                    summarize_proposals(self.request, self.proposals)
+                self.assertEqual(caught.exception.kind, kind)
+
+    def test_english_prose_preserves_foreign_proper_names_and_factual_values(self):
+        self.proposals[0].hotel.name = "The Central House Lisbon Baixa"
+        self.proposals[1].hotel.name = "\u4eac\u90fd\u30db\u30c6\u30eb"
+        self.proposals[2].destination.name = "S\u00e3o Paulo"
+        payload = self.response()
+        payload["items"][0]["advantage"] = "Stay at The Central House Lisbon Baixa, rated 4.3."
+        payload["items"][0]["tradeoff"] = "Suitability for your preferences has not been verified."
+        payload["items"][1]["advantage"] = "A stay at \u4eac\u90fd\u30db\u30c6\u30eb is included in the proposal."
+        payload["items"][2]["title"] = "S\u00e3o Paulo: museums and food"
+        payload["items"][2]["advantage"] = "Direct flights take 210 minutes in total. The total price is 254 EUR."
+        self.set_response(payload)
+        result = summarize_proposals(self.request, self.proposals)
+        self.assertEqual([p.summary.model_dump() for p in result], payload["items"])
+
+    def test_sentence_punctuation_and_title_without_period_are_supported(self):
+        for text in (
+            "Direct flight.", "Prefer fewer stops?", "A practical option!",
+            'The flight is "direct."', "Departure at 09:20.", "No departures before 9.",
+            "The cheapest option with a comfortable flight.",
+        ):
+            with self.subTest(text=text):
+                payload = self.response()
+                payload["items"][0].update(title="Museums and food", advantage=text)
+                self.set_response(payload)
+                result = summarize_proposals(self.request, self.proposals)
+                self.assertEqual(result[0].summary.advantage, text)
+                self.assertIsNone(result[0].summary.tradeoff)
+
+    def test_prompt_requests_short_complete_english_prose_without_internal_labels(self):
+        for instruction in ("180 characters", "complete sentences", "consistent English", "Preserve proper names", "only in its dedicated field"):
+            with self.subTest(instruction=instruction):
+                self.assertIn(instruction, SYSTEM_PROMPT)
 
     def test_schema_forbids_fact_overrides_extra_fields_and_invalid_text(self):
         for field, value in (

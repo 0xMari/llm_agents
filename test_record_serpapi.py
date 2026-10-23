@@ -92,7 +92,7 @@ class FixtureRecorderTest(unittest.TestCase):
 
     def test_existing_file_stops_before_network(self):
         self.output.write_text("existing fixture", encoding="utf-8")
-        with self.assertRaisesRegex(record_serpapi.FixtureRecordingError, "esiste"):
+        with self.assertRaisesRegex(record_serpapi.FixtureRecordingError, "already exists"):
             record_serpapi.record_hotels(self.output, [])
         self.api.assert_not_called()
         self.assertEqual(self.output.read_text(), "existing fixture")
@@ -103,14 +103,14 @@ class FixtureRecorderTest(unittest.TestCase):
                 providers.flights.search_serpapi({"engine": "google_flights"})
 
         with patch("record_serpapi.run_demo", side_effect=demo):
-            with self.assertRaisesRegex(record_serpapi.FixtureRecordingError, "Limite"):
+            with self.assertRaisesRegex(record_serpapi.FixtureRecordingError, "limit"):
                 record_serpapi.record_hotels(self.output, [])
         self.assertEqual(self.api.call_count, 5)
         self.assertFalse(self.output.exists())
 
     def test_no_hotel_search_is_not_reported_as_success(self):
         with patch("record_serpapi.run_demo"):
-            with self.assertRaisesRegex(record_serpapi.FixtureRecordingError, "Nessuna fixture"):
+            with self.assertRaisesRegex(record_serpapi.FixtureRecordingError, "No fixture"):
                 record_serpapi.record_hotels(self.output, [])
         self.assertFalse(self.output.exists())
 

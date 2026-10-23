@@ -42,7 +42,7 @@ def resolve_destinations(request: TripRequest, *, budget: RunBudget) -> list[Sug
         return [
             SuggestedDestination(
                 name=request.destination_pref.destination,
-                reason="Destinazione indicata dall'utente.",
+                reason="Destination specified by the user.",
                 match_score=100,
             )
         ]
@@ -74,13 +74,13 @@ def flight_search_failure(
         reason = ReasonCode.FLIGHT_OUTPUT_INVALID
         details["response_error_kind"] = error.kind
         message = (
-            "La ricerca localita ha restituito dati non utilizzabili."
+            "The location search returned unusable data."
             if stage == "location_resolution" else
-            "La ricerca voli ha restituito dati non utilizzabili."
+            "The flight search returned unusable data."
         )
     else:
         reason = ReasonCode.FLIGHT_PROVIDER_ERROR
-        message = "Il servizio di ricerca voli non e disponibile. Verifica configurazione e quota."
+        message = "The flight search service is unavailable. Check configuration and quota."
     events.append(DecisionEvent(
         event_type=EventType.SEARCH_FAILED,
         reason_code=reason,
@@ -93,10 +93,10 @@ def flight_search_failure(
 def hotel_search_failure(events: list[DecisionEvent], query: HotelSearchQuery, error: SerpAPIError) -> PlanningError:
     if isinstance(error, SerpAPIResponseError):
         reason = ReasonCode.HOTEL_OUTPUT_INVALID
-        message = "La ricerca hotel ha restituito dati non utilizzabili."
+        message = "The hotel search returned unusable data."
     else:
         reason = ReasonCode.HOTEL_PROVIDER_ERROR
-        message = "Il servizio di ricerca hotel non e disponibile. Verifica configurazione e quota."
+        message = "The hotel search service is unavailable. Check configuration and quota."
     events.append(DecisionEvent(
         event_type=EventType.SEARCH_FAILED,
         reason_code=reason,
@@ -135,7 +135,7 @@ def build_proposal(request: TripRequest, *, limits: SearchLimits) -> TripSearchR
     try:
         result = _build_proposal(request, budget=budget, events=events)
     except SearchLimitExceeded as error:
-        message = "Ricerca interrotta: raggiunto il limite di chiamate configurato."
+        message = "Search stopped: the configured call limit was reached."
         events.append(DecisionEvent(
             event_type=EventType.SEARCH_FAILED,
             reason_code=ReasonCode.SEARCH_LIMIT_REACHED,
@@ -170,7 +170,7 @@ def record_scope_reduction(
             "scope": scope, "available_count": available, "unique_count": unique,
             "selected_count": selected, "destination": destination,
         },
-        comment="Ricerca ridotta dopo ordinamento, deduplicazione e applicazione dei limiti.",
+        comment="Search scope reduced after ranking, deduplication, and applying limits.",
     ))
 
 
@@ -193,7 +193,7 @@ def _build_proposal(
             event_type = EventType.REQUEST_ROUTED,
             reason_code = ReasonCode.SCENARIO_DETECTED,
             details = {"scenario": scenario.value},
-            comment = "Scenario di pianificazione identificato.",
+            comment = "Planning scenario identified.",
         )
     )
 
@@ -212,13 +212,13 @@ def _build_proposal(
                 event_type=EventType.DESTINATION_RESOLUTION_FAILED,
                 reason_code=reason,
                 details=details,
-                comment="Selezione delle destinazioni non completata.",
+                comment="Destination selection could not be completed.",
             )
         )
 
         return PlanningError(
             code=reason.value,
-            message="Non e stato possibile proporre destinazioni.",
+            message="Unable to suggest destinations.",
             trace=DecisionTrace(events=events),
         )
 
@@ -240,7 +240,7 @@ def _build_proposal(
             details={
                 "destinations": [destination.name for destination in destinations],
             },
-            comment="Destinazioni candidate risolte.",
+            comment="Candidate destinations resolved.",
         )
     )
 
@@ -262,11 +262,11 @@ def _build_proposal(
                 event_type=EventType.TRAVEL_WINDOW_FAILED,
                 reason_code=reason,
                 details=details,
-                comment="Valutazione del periodo non completata.",
+                comment="Travel window evaluation could not be completed.",
             ))
             return PlanningError(
                 code=reason.value,
-                message="Non e stato possibile valutare il periodo di viaggio.",
+                message="Unable to evaluate the travel window.",
                 trace=DecisionTrace(events=events),
             )
 
@@ -335,7 +335,7 @@ def _build_proposal(
                         "end": period.end.isoformat(),
                         "score": period.score,
                     },
-                    comment = "Periodo candidato analizzato",
+                    comment = "Candidate travel period analyzed.",
                 )
             )
 
@@ -368,7 +368,7 @@ def _build_proposal(
                             "start": period.start.isoformat(),
                             "end": period.end.isoformat(),
                         },
-                        comment = "Nessun volo trovato per il periodo.",
+                        comment = "No flights found for this travel period.",
                     )
                 )
                 continue
@@ -383,7 +383,7 @@ def _build_proposal(
                         event_type=EventType.SEARCH_FAILED,
                         reason_code=ReasonCode.NO_HOTELS_FOUND,
                         details={"destination": destination.name},
-                        comment="Le tratte selezionate non lasciano una notte per il soggiorno.",
+                        comment="The selected flights do not allow an overnight stay.",
                     ))
                     continue
                 hotel_query = HotelSearchQuery(
@@ -418,7 +418,7 @@ def _build_proposal(
                                 "start": checkin.isoformat(),
                                 "end": checkout.isoformat(),
                             },
-                            comment="Nessun hotel trovato per il soggiorno.",
+                            comment="No hotels found for this stay.",
                         )
                     )
                     continue
@@ -439,19 +439,19 @@ def _build_proposal(
                                     "budget_eur": request.budget_eur,
                                     "budget_ceiling_eur": budget_ceiling,
                                 },
-                                comment = "Combinazione esclusa: supera anche il budget massimo tollerato.",
+                                comment = "Combination excluded: it exceeds the maximum allowed budget.",
                             )
                         )
                         continue
                     if request.budget_eur is None:
                         budget_reason = ReasonCode.NO_BUDGET_PROVIDED
-                        budget_comment = "Nessun limite di budget indicato."
+                        budget_comment = "No budget limit provided."
                     elif total_price <= request.budget_eur:
                         budget_reason = ReasonCode.WITHIN_BUDGET
-                        budget_comment = "Combinazione entro budget."
+                        budget_comment = "Combination within budget."
                     else:
                         budget_reason = ReasonCode.OVER_PREFERRED_BUDGET
-                        budget_comment = "Combinazione leggermente sopra il budget preferito, ma entro la flessibilità impostata."
+                        budget_comment = "Combination above the preferred budget, but within the allowed flexibility."
 
                     comments = [
                         ProposalComment(
@@ -469,7 +469,7 @@ def _build_proposal(
                         comments.append(
                             ProposalComment(
                                 reason_code = ReasonCode.DIRECT_FLIGHT,
-                                comment = "Volo diretto.",
+                                comment = "Direct flight.",
                             )
                         )
 
@@ -478,7 +478,7 @@ def _build_proposal(
                             ProposalComment(
                                 reason_code = ReasonCode.GOOD_HOTEL_RATING,
                                 details = {"hotel_rating": hotel.rating},
-                                comment = "Hotel con buon rating.",
+                                comment = "Well-rated hotel.",
                             )
                         )
                     
@@ -493,7 +493,7 @@ def _build_proposal(
                                 "budget_eur": request.budget_eur,
                                 "budget_ceiling_eur": budget_ceiling,
                             },
-                            comment = "Combinazione accettata.",
+                            comment = "Combination accepted.",
                         )
                     )
 
@@ -518,7 +518,7 @@ def _build_proposal(
     if not proposals:
         if search_issues:
             reason = search_issues[0].code
-            message = "Nessuna proposta utilizzabile: alcune ricerche sulle destinazioni non sono state completate."
+            message = "No usable proposals: some destination searches could not be completed."
             events.append(DecisionEvent(
                 event_type=EventType.SEARCH_FAILED, reason_code=reason,
                 details={"affected_destinations": list(dict.fromkeys(issue.destination for issue in search_issues))},
@@ -527,13 +527,13 @@ def _build_proposal(
             return PlanningError(code=reason.value, message=message, trace=DecisionTrace(events=events))
         if not found_flights:
             reason = ReasonCode.NO_FLIGHTS_FOUND
-            message = "Nessun volo trovato per le destinazioni e i periodi cercati."
+            message = "No flights found for the searched destinations and travel periods."
         elif not found_combinations:
             reason = ReasonCode.NO_HOTELS_FOUND
-            message = "Nessun hotel trovato per i soggiorni associati ai voli disponibili."
+            message = "No hotels found for stays matching the available flights."
         else:
             reason = ReasonCode.NO_AFFORDABLE_PROPOSAL
-            message = "Le combinazioni trovate superano il budget massimo consentito."
+            message = "The available combinations exceed the maximum allowed budget."
 
         return PlanningError(
             code = reason.value,
@@ -559,13 +559,16 @@ def _build_proposal(
             details.update(service=exc.service, used=exc.used, limit=exc.limit)
         elif isinstance(exc, InvalidProposalSummary):
             reason = ReasonCode.LLM_CONSTRAINT_VIOLATION
+            details["summary_quality_issue"] = exc.kind
+            if exc.field is not None:
+                details["summary_field"] = exc.field
         else:
             reason = ReasonCode.LLM_OUTPUT_INVALID
         events.append(DecisionEvent(
             event_type=EventType.PROPOSAL_SUMMARY_FAILED,
             reason_code=reason,
             details=details,
-            comment="Sintesi non disponibile: le offerte e i confronti restano utilizzabili.",
+            comment="Summary unavailable: offers and comparisons remain usable.",
         ))
     else:
         summary_status = "generated"
@@ -573,7 +576,7 @@ def _build_proposal(
             event_type=EventType.PROPOSAL_SUMMARY_GENERATED,
             reason_code=ReasonCode.PROPOSAL_SUMMARY_GENERATED,
             details={"summarized_count": len(selected)},
-            comment="Sintesi aggiunta senza modificare offerte e confronti.",
+            comment="Summary added without changing offers or comparisons.",
         ))
 
     events.append(
@@ -593,9 +596,9 @@ def _build_proposal(
                 "destination_city_ids": list(dict.fromkeys(p.destination_city_id for p in selected)),
             },
             comment = (
-                "Selezionata una combinazione per citta, fino a tre, ordinate per pertinenza stimata alla richiesta e nel rispetto del budget."
+                "Selected one combination per city, up to three, ranked by estimated relevance to the request and within the allowed budget."
                 if request.destination_pref.mode == "open" else
-                "Selezionate fino a tre combinazioni per prezzo e comodita del volo, nel rispetto del budget."
+                "Selected up to three combinations based on price and flight comfort, within the allowed budget."
             ),
         )
     )

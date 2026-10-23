@@ -7,7 +7,7 @@ def add_comparisons(
 ) -> list[TripProposal]:
     """Compare selected trips with the cheapest; IDs are local to this result."""
     if type(early_hour) is not int or not 0 <= early_hour <= 23:
-        raise ValueError("early_hour deve essere un intero tra 0 e 23.")
+        raise ValueError("early_hour must be an integer between 0 and 23.")
     if not proposals:
         return []
 

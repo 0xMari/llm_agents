@@ -178,9 +178,9 @@ class FlightProviderTest(unittest.TestCase):
                     parse_flight_leg(value)
 
     def test_changed_departure_dates_are_rejected(self):
-        with self.assertRaisesRegex(SerpAPIResponseError, "data"):
+        with self.assertRaisesRegex(SerpAPIResponseError, "date"):
             self.search_pair(outbound=raw_leg(day=date(2026, 9, 16), token="wrong-date"))
-        with self.assertRaisesRegex(SerpAPIResponseError, "data"):
+        with self.assertRaisesRegex(SerpAPIResponseError, "date"):
             self.search_pair(inbound=raw_leg("LIS", "FCO", date(2026, 9, 21)))
 
     def test_city_scope_allows_different_return_airport(self):
@@ -195,7 +195,7 @@ class FlightProviderTest(unittest.TestCase):
             (self.outbound, raw_leg("LIS", "CIA", date(2026, 9, 20))),
         ):
             with self.subTest(outbound=outbound):
-                with self.assertRaisesRegex(SerpAPIResponseError, "aeroportuale"):
+                with self.assertRaisesRegex(SerpAPIResponseError, "airport"):
                     self.search_pair(outbound=outbound, inbound=inbound, query=query)
 
     def test_outbound_limit_diversifies_airports_and_deduplicates_tokens(self):

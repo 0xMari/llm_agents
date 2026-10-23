@@ -23,15 +23,15 @@ class FixtureRecordingError(RuntimeError):
 
 def build_hotel_fixture(params: dict, response: dict) -> dict:
     if params.get("engine") != "google_hotels" or params.get("currency") != "EUR":
-        raise FixtureRecordingError("Il registratore supporta soltanto hotel in EUR.")
+        raise FixtureRecordingError("The recorder only supports hotels priced in EUR.")
     location = params.get("q")
     if not isinstance(location, str) or not location.startswith("Hotels in "):
-        raise FixtureRecordingError("Query hotel inattesa: nessuna fixture scritta.")
+        raise FixtureRecordingError("Unexpected hotel query: no fixture written.")
     items = response.get("properties")
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
-        raise FixtureRecordingError("Risposta non in formato elenco hotel: da analizzare.")
+        raise FixtureRecordingError("The response is not a hotel list: inspection required.")
     if not items:
-        raise FixtureRecordingError("Nessun hotel: non e una fixture per il percorso positivo.")
+        raise FixtureRecordingError("No hotels: this is not a success-path fixture.")
 
     query = HotelSearchQuery(
         destination=location.removeprefix("Hotels in "),
@@ -49,7 +49,7 @@ def build_hotel_fixture(params: dict, response: dict) -> dict:
                 continue
             rate = item[key]
             if rate is not None and not isinstance(rate, dict):
-                raise FixtureRecordingError("Formato del prezzo inatteso: nessuna fixture scritta.")
+                raise FixtureRecordingError("Unexpected price format: no fixture written.")
             clean[key] = None if rate is None else {
                 field: rate[field]
                 for field in ("extracted_lowest", "extracted_before_taxes_fees")
@@ -60,7 +60,7 @@ def build_hotel_fixture(params: dict, response: dict) -> dict:
             if isinstance(clean.get(key), dict):
                 values.extend(clean[key].values())
         if any(value is not None and not isinstance(value, (str, int, float)) for value in values):
-            raise FixtureRecordingError("Campi non scalari inattesi: nessuna fixture scritta.")
+            raise FixtureRecordingError("Unexpected non-scalar fields: no fixture written.")
         properties.append(clean)
 
     return {
@@ -77,14 +77,14 @@ def build_hotel_fixture(params: dict, response: dict) -> dict:
 
 def record_hotels(output: Path, demo_args: list[str]) -> int:
     if output.exists():
-        raise FixtureRecordingError("Il file esiste gia: scegli un altro nome con --output.")
+        raise FixtureRecordingError("The file already exists: choose another name with --output.")
     calls = 0
     captured = False
 
     def recording_search(params, *, budget=None):
         nonlocal calls, captured
         if calls >= MAX_CALLS:
-            raise FixtureRecordingError("Limite di cinque chiamate raggiunto: ricerca interrotta.")
+            raise FixtureRecordingError("Five-call limit reached: search stopped.")
         calls += 1
         response = live_search(params, budget=budget)
         if params.get("engine") == "google_hotels":
@@ -92,12 +92,12 @@ def record_hotels(output: Path, demo_args: list[str]) -> int:
             try:
                 payload = json.dumps(fixture, ensure_ascii=False, indent=2, allow_nan=False)
             except ValueError:
-                raise FixtureRecordingError("Valori JSON non validi: nessuna fixture scritta.") from None
+                raise FixtureRecordingError("Invalid JSON values: no fixture written.") from None
             output.parent.mkdir(parents=True, exist_ok=True)
             with output.open("x", encoding="utf-8") as file:
                 file.write(payload + "\n")
             captured = True
-            print(f"Fixture hotel registrata: {output}")
+            print(f"Hotel fixture recorded: {output}")
         return response
 
     # Patch only the manual run; the actual HTTP client and parsers still execute.
@@ -106,19 +106,19 @@ def record_hotels(output: Path, demo_args: list[str]) -> int:
     ):
         run_demo([*demo_args, "--max-outbound", "1", "--hotels"])
     if not captured:
-        raise FixtureRecordingError("Nessuna fixture registrata: non e stata raggiunta la ricerca hotel.")
-    print(f"Chiamate SerpAPI eseguite: {calls}/{MAX_CALLS}. Controlla la fixture prima del commit.")
+        raise FixtureRecordingError("No fixture recorded: the hotel search was not reached.")
+    print(f"SerpAPI calls made: {calls}/{MAX_CALLS}. Review the fixture before committing.")
     return calls
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Registra una fixture hotel reale: fino a cinque chiamate SerpAPI, nessuna chiamata LLM."
+        description="Record a real hotel fixture: up to five SerpAPI calls, no LLM calls."
     )
     parser.add_argument("--origin", default="Rome, Italy")
     parser.add_argument("--destination", default="Lisbon, Portugal")
-    parser.add_argument("--origin-city-id", help="Seleziona una citta tra i risultati autocomplete dell'origine.")
-    parser.add_argument("--destination-city-id", help="Seleziona una citta tra i risultati autocomplete della destinazione.")
+    parser.add_argument("--origin-city-id", help="Select a city from the origin autocomplete results.")
+    parser.add_argument("--destination-city-id", help="Select a city from the destination autocomplete results.")
     parser.add_argument("--departure-date", type=date.fromisoformat)
     parser.add_argument("--return-date", type=date.fromisoformat)
     parser.add_argument("--adults", type=int, default=1)
@@ -140,7 +140,7 @@ if __name__ == "__main__":
     try:
         main()
     except FlightLocationError as error:
-        print("Localita da chiarire:", error)
+        print("Location needs clarification:", error)
         for option in error.options:
             print(option)
         raise SystemExit(1) from None

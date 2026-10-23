@@ -1,4 +1,4 @@
-# agenti simulati
+# Simulated agents.
 
 from datetime import date
 
@@ -10,26 +10,26 @@ def suggest_periods(request: TripRequest) -> list[SuggestedTimePeriod]:
         SuggestedTimePeriod(
             start = date(2026, 9, 15),
             end = date(2026, 9, 20),
-            reason = "Temperature miti e prezzi generalmente convenienti.",
+            reason = "Mild temperatures and generally affordable prices.",
             score = 90,
         ),
         SuggestedTimePeriod(
             start = date(2026, 10, 6),
             end = date(2026, 10, 11),
-            reason = "Periodo tranquillo, adatto a musei e gastronomia.",
+            reason = "A quieter period suited to museums and local food.",
             score = 82,
         ),
     ]
 
 
 def suggest_activities(request: TripRequest) -> list[str]:
-    recommendations = ["Prenota una tariffa con cancellazione gratuita."]
+    recommendations = ["Book a rate with free cancellation."]
     themes = request.vibe.themes
 
     if "food" in themes:
-        recommendations.append("Esplora i mercati e i ristoranti locali.")
+        recommendations.append("Explore local markets and restaurants.")
 
     if "museums" in themes or "culture" in themes:
-        recommendations.append("Controlla giorni di apertura e prenotazioni dei musei.")
+        recommendations.append("Check museum opening days and reservation requirements.")
 
     return recommendations

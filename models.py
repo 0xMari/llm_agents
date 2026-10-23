@@ -30,19 +30,19 @@ class TimePreference(BaseModel):
     def validate_time_preference(self) -> Self:
         if self.min_days is not None and self.max_days is not None:
             if self.min_days > self.max_days:
-                raise ValueError("min_days non puo superare max_days.")
+                raise ValueError("min_days cannot exceed max_days.")
 
         if self.mode == "exact_dates":
             if self.start_date is None or self.end_date is None:
-                raise ValueError("Con mode='exact_dates' servono start_date e end_date.")
+                raise ValueError("mode='exact_dates' requires start_date and end_date.")
             if self.end_date <= self.start_date:
-                raise ValueError("end_date deve essere successiva a start_date.")
+                raise ValueError("end_date must be later than start_date.")
 
         if self.mode == "month" and self.month is None:
-            raise ValueError("Con mode='month' devi specificare month.")
+            raise ValueError("mode='month' requires month.")
 
         if self.mode == "season" and self.season is None:
-            raise ValueError("Con mode='season' devi specificare season.")
+            raise ValueError("mode='season' requires season.")
 
         return self
 
@@ -55,9 +55,9 @@ class DestinationPreference(BaseModel):
     @model_validator(mode="after")
     def validate_destination(self) -> Self:
         if self.mode == "fixed" and not self.destination:
-            raise ValueError("Con mode='fixed' devi specificare destination.")
+            raise ValueError("mode='fixed' requires destination.")
         if self.mode == "open" and (self.city_id is not None or self.airport_code is not None):
-            raise ValueError("Gli identificativi di arrivo richiedono una destinazione fissa.")
+            raise ValueError("Arrival identifiers require a fixed destination.")
         return self
 
 
@@ -86,7 +86,7 @@ class DestinationAdvice(BaseModel):
     def unique_destinations(self) -> Self:
         keys = [(d.name.casefold(), d.country.casefold()) for d in self.destinations]
         if len(keys) != len(set(keys)):
-            raise ValueError("Destinazioni duplicate.")
+            raise ValueError("Duplicate destinations.")
         return self
 
 class TravelVibe(BaseModel):
@@ -116,7 +116,7 @@ class SuggestedTimePeriod(BaseModel):
     @model_validator(mode="after")
     def validate_dates(self) -> Self:
         if self.end <= self.start:
-            raise ValueError("La data finale deve essere successiva a quella iniziale.")
+            raise ValueError("The end date must be later than the start date.")
         return self
 
 
@@ -154,7 +154,7 @@ class FlightSearchQuery(BaseModel):
     @model_validator(mode="after")
     def validate_dates(self) -> Self:
         if self.return_date <= self.departure_date:
-            raise ValueError("Il ritorno deve essere successivo alla partenza.")
+            raise ValueError("The return date must be later than the departure date.")
         return self
 
 class FlightSegment(BaseModel):
@@ -194,11 +194,11 @@ class FlightOffer(BaseModel):
     @model_validator(mode="after")
     def validate_leg_summaries(self) -> Self:
         if self.departure_date != self.outbound.segments[0].departure_local.date():
-            raise ValueError("La data di partenza non corrisponde all'andata.")
+            raise ValueError("The departure date does not match the outbound flight.")
         if self.return_date != self.inbound.segments[0].departure_local.date():
-            raise ValueError("La data di ritorno non corrisponde alla tratta di ritorno.")
+            raise ValueError("The return date does not match the inbound flight.")
         if self.stops != self.outbound.stops + self.inbound.stops:
-            raise ValueError("Il numero di scali non corrisponde alle tratte.")
+            raise ValueError("The stop count does not match the flight legs.")
         return self
 
 
@@ -215,7 +215,7 @@ class HotelSearchQuery(BaseModel):
     @model_validator(mode="after")
     def validate_stay_dates(self) -> Self:
         if self.checkout_date <= self.checkin_date:
-            raise ValueError("Il checkout deve essere successivo al checkin.")
+            raise ValueError("Checkout must be later than check-in.")
         return self
 
 

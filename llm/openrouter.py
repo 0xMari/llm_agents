@@ -9,19 +9,19 @@ from execution import RunBudget
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 _ERROR_MESSAGES = {
-    "configuration_error": "Configurazione OpenRouter incompleta.",
-    "timeout": "Tempo di attesa OpenRouter superato.",
-    "network_error": "Connessione a OpenRouter non riuscita.",
-    "authentication_error": "Autenticazione OpenRouter non riuscita.",
-    "payment_required": "OpenRouter richiede una verifica del credito o dei limiti di spesa.",
-    "permission_denied": "Richiesta OpenRouter non consentita.",
-    "rate_limit": "Limite di richieste del provider LLM raggiunto.",
-    "invalid_request": "OpenRouter ha rifiutato i parametri della richiesta.",
-    "not_found": "Risorsa o endpoint OpenRouter non trovato.",
-    "model_incompatible": "Nessun endpoint selezionato supporta i parametri richiesti.",
-    "provider_unavailable": "Provider LLM non disponibile per questa richiesta.",
-    "provider_error": "Il provider LLM ha restituito un errore.",
-    "invalid_response": "OpenRouter ha restituito una risposta non utilizzabile.",
+    "configuration_error": "Incomplete OpenRouter configuration.",
+    "timeout": "The OpenRouter request timed out.",
+    "network_error": "Unable to connect to OpenRouter.",
+    "authentication_error": "OpenRouter authentication failed.",
+    "payment_required": "Check OpenRouter credit and spending limits.",
+    "permission_denied": "The OpenRouter request is not permitted.",
+    "rate_limit": "The LLM provider's request limit was reached.",
+    "invalid_request": "OpenRouter rejected the request parameters.",
+    "not_found": "OpenRouter resource or endpoint not found.",
+    "model_incompatible": "No selected endpoint supports the requested parameters.",
+    "provider_unavailable": "The LLM provider is unavailable for this request.",
+    "provider_error": "The LLM provider returned an error.",
+    "invalid_response": "OpenRouter returned an unusable response.",
 }
 
 _HTTP_ERROR_KINDS = {
@@ -137,10 +137,10 @@ def call_openrouter_json(
     model = os.getenv("OPENROUTER_MODEL")
 
     if not api_key or not api_key.strip():
-        raise OpenRouterError("OPENROUTER_API_KEY non configurata.", kind="configuration_error")
+        raise OpenRouterError("OPENROUTER_API_KEY is not configured.", kind="configuration_error")
 
     if not model or not model.strip():
-        raise OpenRouterError("OPENROUTER_MODEL non configurato.", kind="configuration_error")
+        raise OpenRouterError("OPENROUTER_MODEL is not configured.", kind="configuration_error")
 
     if budget is not None:
         budget.claim("llm")
