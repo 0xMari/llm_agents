@@ -305,7 +305,12 @@ def _build_proposal(
             for location_index, (text, city_id, airport_code) in enumerate(locations):
                 key = (text, city_id)
                 if key not in city_cache:
-                    city_cache[key] = resolve_city(text, city_id=city_id, budget=budget)
+                    city_cache[key] = resolve_city(
+                        text,
+                        country=destination.country if location_index == 1 else None,
+                        city_id=city_id,
+                        budget=budget,
+                    )
                 search_ids.append(search_id_for(city_cache[key], airport_code))
         except (SerpAPIError, FlightLocationError) as error:
             failure = flight_search_failure(

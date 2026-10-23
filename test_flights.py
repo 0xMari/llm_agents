@@ -18,6 +18,7 @@ from providers.flights import (
     find_city_options,
     parse_flight_leg,
     resolve_city,
+    select_city_candidate,
     search_flights,
     search_id_for,
 )
@@ -50,7 +51,7 @@ def make_flight(price=180, *, start=date(2026, 9, 15), end=date(2026, 9, 20), vi
     )
 
 
-def fake_city(text, *, city_id=None, budget=None):
+def fake_city(text, *, country=None, city_id=None, budget=None):
     name = text.split(",")[0]
     codes = {"Rome": ["FCO", "CIA"], "Lisbon": ["LIS"], "Milan": ["MXP", "LIN"]}.get(name, ["NRT"])
     return {
@@ -276,6 +277,69 @@ class FlightProviderTest(unittest.TestCase):
         self.api.return_value = {"suggestions": [fake_city("Lisbon")]}
         with self.assertRaises(FlightLocationError):
             resolve_city("Rome")
+
+    def test_country_description_resolves_bare_city_name_without_extra_calls(self):
+        city = {**fake_city("Florence", city_id="/m/031y2"), "description": "City in Italy"}
+        self.api.return_value = {"suggestions": [city]}
+        for text in ("Florence", "Florence, Italy", " Florence, ITALY "):
+            with self.subTest(text=text):
+                self.api.reset_mock()
+                self.assertEqual(resolve_city(text, country=" Italy "), city)
+                self.api.assert_called_once()
+                self.assertEqual(self.api.call_args.args[0]["q"], "Florence, Italy")
+        self.assertEqual(city["name"], "Florence")
+        self.assertEqual(city["description"], "City in Italy")
+
+    def test_explicit_english_country_descriptions_are_supported(self):
+        for description in ("City in Italy", "Town in Italy", "Capital of Italy", "Municipality in Italy", " CITY IN ITALY. "):
+            with self.subTest(description=description):
+                city = {**fake_city("Florence"), "description": description}
+                self.assertEqual(select_city_candidate([city], "Florence", country="Italy"), city)
+        self.api.assert_not_called()
+
+    def test_country_is_not_inferred_from_query_or_regional_description(self):
+        for description in (None, "", {}, "City in Tuscany", "City in Italy and France", "City in USA"):
+            with self.subTest(description=description):
+                city = {**fake_city("Florence"), "description": description}
+                self.api.return_value = {"suggestions": [city]}
+                with self.assertRaises(FlightLocationError) as caught:
+                    resolve_city("Florence", country="Italy")
+                self.assertEqual(caught.exception.options, [f"Florence ({city['id']})"])
+
+    def test_country_filter_preserves_ambiguity_and_explicit_id_selection(self):
+        first = {**fake_city("Florence", city_id="/m/031y2"), "description": "City in Italy"}
+        second = {**first, "id": "/m/test_other_florence"}
+        self.api.return_value = {"suggestions": [first, second]}
+        with self.assertRaises(FlightLocationError) as caught:
+            resolve_city("Florence", country="Italy")
+        self.assertEqual(len(caught.exception.options), 2)
+        self.assertEqual(resolve_city("Florence", country="Italy", city_id=first["id"]), first)
+        with self.assertRaises(FlightLocationError):
+            resolve_city("Florence", country="Italy", city_id="/m/not_in_response")
+
+    def test_confirmed_city_id_can_select_city_without_country_evidence(self):
+        city = fake_city("Florence", city_id="/m/031y2")
+        self.api.return_value = {"suggestions": [city]}
+        self.assertEqual(resolve_city("Florence", country="Italy", city_id=city["id"]), city)
+
+    def test_country_filter_rejects_wrong_country_and_same_country_different_name(self):
+        cities = [
+            {**fake_city("Florence, USA"), "description": "City in Italy"},
+            fake_city("Rome, Italy"),
+        ]
+        with self.assertRaises(FlightLocationError):
+            select_city_candidate(cities, "Florence", country="Italy")
+
+    def test_country_filter_accepts_qualified_name_and_normalized_accents(self):
+        self.api.return_value = supplied_valencia_autocomplete()
+        city = resolve_city("Valencia, Spain", country="Spain")
+        self.assertEqual(city["id"], "/m/0h3tv")
+        self.assertEqual(self.api.call_args.args[0]["q"], "Valencia, Spain")
+
+    def test_empty_country_is_rejected_before_autocomplete(self):
+        with self.assertRaises(FlightLocationError):
+            resolve_city("Florence", country=" ")
+        self.api.assert_not_called()
 
     def test_recorded_autocomplete_ignores_suggestions_without_city_type(self):
         response = recorded_rome_autocomplete()

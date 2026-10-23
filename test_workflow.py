@@ -1688,6 +1688,40 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(result.proposals[0].total_price_eur, Decimal("559.99"))
         self.assertEqual(result.proposals[0].selection_profiles, ["cheapest", "comfortable"])
 
+    def test_open_destination_resolves_bare_florence_using_country_description(self):
+        destination = SuggestedDestination(
+            name="Florence", country="Italy", reason="Museums", match_score=90,
+        )
+        city = {
+            **fake_city("Florence", city_id="/m/031y2"),
+            "description": "City in Italy", "airports": [{"id": "FLR"}],
+        }
+        responses = [
+            {"suggestions": [fake_city("Rome, Italy")]},
+            {"suggestions": [city]},
+            {"best_flights": [raw_leg(destination="FLR", token="florence-token")]},
+            {"other_flights": [raw_leg("FLR", "FCO", date(2026, 9, 20), price=180)]},
+        ]
+        _, hotel = fake_flight_and_hotel(500)
+        self.fake_hotel_search.side_effect = None
+        self.fake_hotel_search.return_value = [hotel.model_copy(update={"destination": "Florence"})]
+        with patch("planning.resolve_destinations", return_value=[destination]), patch(
+            "planning.resolve_city", resolve_city
+        ), patch("planning.search_flights", search_flights), patch(
+            "providers.flights.search_serpapi", side_effect=responses
+        ) as api:
+            result = self.build_proposal(self.flight_request(
+                destination_pref=DestinationPreference(mode="open"),
+            ))
+        self.assertNotIsInstance(result, PlanningError)
+        self.assertEqual(result.search_status, "complete")
+        self.assertEqual(result.search_issues, [])
+        self.assertEqual(result.proposals[0].destination_city_id, "/m/031y2")
+        self.assertEqual(api.call_count, 4)
+        self.assertEqual([call.args[0]["q"] for call in api.call_args_list[:2]], ["Rome", "Florence, Italy"])
+        self.assertEqual(api.call_args_list[2].args[0]["arrival_id"], "/m/031y2")
+        self.assertEqual(self.fake_hotel_search.call_args.args[0].location_name, "Florence")
+
     def test_airports_only_restrict_queries_when_explicit(self):
         result = self.build_proposal(self.flight_request(
             origin_city_id="/m/chosen_rome",
@@ -1697,8 +1731,8 @@ class WorkflowTest(unittest.TestCase):
             ),
         ))
         self.assertNotIsInstance(result, PlanningError)
-        self.fake_resolve_city.assert_any_call("Rome", city_id="/m/chosen_rome", budget=ANY)
-        self.fake_resolve_city.assert_any_call("Lisbon", city_id="/m/chosen_lisbon", budget=ANY)
+        self.fake_resolve_city.assert_any_call("Rome", country=None, city_id="/m/chosen_rome", budget=ANY)
+        self.fake_resolve_city.assert_any_call("Lisbon", country=None, city_id="/m/chosen_lisbon", budget=ANY)
         query = self.fake_flight_search.call_args.args[0]
         self.assertEqual((query.origin_id, query.destination_id), ("FCO", "LIS"))
         self.assertTrue(all(p.destination_city_id == "/m/chosen_lisbon" for p in result.proposals))
@@ -1766,7 +1800,7 @@ class WorkflowTest(unittest.TestCase):
         hotels.assert_not_called()
 
     def test_hotel_query_uses_verified_city_and_same_guests_as_flights(self):
-        def canonical_city(text, *, city_id=None, budget=None):
+        def canonical_city(text, *, country=None, city_id=None, budget=None):
             name = {"Rome": "Rome, Italy", "Lisbon": "Lisbon, Portugal"}.get(text, text)
             return fake_city(name, city_id=city_id)
 

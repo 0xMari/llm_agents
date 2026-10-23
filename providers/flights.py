@@ -85,23 +85,71 @@ def _normalized_location_name(text: str) -> str:
     return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
 
 
-def resolve_city(text: str, *, city_id: str | None = None, budget: RunBudget | None = None) -> dict:
-    cities = find_city_options(text, budget=budget)
-    normalized = _normalized_location_name(text)
-    if city_id is not None:
-        matches = [city for city in cities if city["id"] == city_id]
-    else:
-        matches = []
-        for city in cities:
-            name = _normalized_location_name(city["name"])
-            if name == normalized or ("," not in normalized and name.split(",")[0] == normalized):
-                matches.append(city)
+def _country_matches(city: dict, country: str) -> bool:
+    expected = _normalized_location_name(country)
+    label = _normalized_location_name(city["name"])
+    if "," in label:
+        return label.rsplit(",", 1)[1].strip() == expected
+
+    description = city.get("description")
+    if not isinstance(description, str):
+        return False
+    # Autocomplete uses hl=en; only explicit country descriptions are accepted.
+    description = _normalized_location_name(description).rstrip(".")
+    return description in {
+        f"city in {expected}",
+        f"town in {expected}",
+        f"capital of {expected}",
+        f"municipality in {expected}",
+    }
+
+
+def select_city_candidate(
+    cities: list[dict], name: str, *,
+    country: str | None = None, city_id: str | None = None,
+) -> dict:
+    wanted = _normalized_location_name(name)
+    matches = []
+    for city in cities:
+        label = _normalized_location_name(city["name"])
+        if city_id is not None:
+            compatible = city["id"] == city_id
+        elif country is not None:
+            compatible = (
+                label.split(",")[0].strip() == wanted
+                and _country_matches(city, country)
+            )
+        else:
+            compatible = label == wanted or (
+                "," not in wanted and label.split(",")[0].strip() == wanted
+            )
+        if compatible:
+            matches.append(city)
     if len(matches) != 1:
+        text = ", ".join(filter(None, [name, country]))
         raise FlightLocationError(
             f"Localita non risolta: {text!r}. Specifica la citta e il paese oppure scegli un city_id verificato.",
             options=[f"{city['name']} ({city['id']})" for city in cities],
         )
     return matches[0]
+
+
+def resolve_city(
+    text: str, *, country: str | None = None,
+    city_id: str | None = None, budget: RunBudget | None = None,
+) -> dict:
+    name = text.strip()
+    if country is not None:
+        country = country.strip()
+        if not country:
+            raise FlightLocationError("Il paese non puo essere vuoto.")
+        prefix, separator, suffix = name.rpartition(",")
+        if separator and _normalized_location_name(suffix) == _normalized_location_name(country):
+            name = prefix.strip()
+
+    query = f"{name}, {country}" if country is not None else name
+    cities = find_city_options(query, budget=budget)
+    return select_city_candidate(cities, name, country=country, city_id=city_id)
 
 
 def search_id_for(city: dict, airport_code: str | None = None) -> str:
