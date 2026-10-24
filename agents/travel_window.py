@@ -71,7 +71,10 @@ Rules:
 - If exact dates are not ideal, add warnings and alternatives.
 - For a month, season, or flexible window, suggest periods consistent with the request.
 - If time_preference.mode is "month", selected_periods must use time_context.resolved_year.
-- Do not invent years different from those supplied in time_context.
+- Use time_context.reference_date to determine whether an alternative period is in the past.
+- Alternative periods must start on or after time_context.reference_date.
+- Alternatives may fall in a later year, including the next calendar year.
+- For month mode, time_context.resolved_year constrains selected_periods only.
 - Respect min_days and max_days when provided.
 - min_days and max_days are inclusive days: count both departure and return days.
 - Calculate duration as (end - start).days + 1.
@@ -121,6 +124,27 @@ def build_user_prompt(
 
 class TravelWindowConstraintError(ValueError):
     pass
+
+
+def remove_past_alternatives(
+    advice: TravelWindowAdvice,
+    reference_date: date,
+) -> TravelWindowAdvice:
+    upcoming = [
+        period for period in advice.alternatives
+        if period.start >= reference_date
+    ]
+    if len(upcoming) == len(advice.alternatives):
+        return advice
+
+    return advice.model_copy(update={
+        "alternatives": upcoming,
+        "warnings": [
+            *advice.warnings,
+            "Past alternative travel periods were omitted.",
+        ],
+    })
+
 
 def validate_travel_window_constraints(
     request: TripRequest,
@@ -204,4 +228,4 @@ def evaluate_travel_window(
     advice = TravelWindowAdvice.model_validate_json(raw_json)
     validate_travel_window_constraints(request, advice, resolved_reference_date)
 
-    return advice
+    return remove_past_alternatives(advice, resolved_reference_date)

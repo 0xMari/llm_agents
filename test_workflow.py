@@ -22,7 +22,10 @@ from test_proposal_summary import fake_summary_response
 
 from scoring import score_proposal, select_final_proposals
 from agents.destination_agent import suggest_destinations
-from agents.travel_window import evaluate_travel_window, resolve_month_year
+from agents.travel_window import (
+    build_system_prompt, evaluate_travel_window, remove_past_alternatives,
+    resolve_month_year,
+)
 
 from models import (
     TripRequest,
@@ -37,7 +40,8 @@ from models import (
     FlightSearchQuery,
     HotelOffer,
     HotelSearchQuery,
-    SuggestedDestination
+    SuggestedDestination,
+    TravelWindowAdvice,
 )
 
 def fake_travel_window_response(
@@ -299,6 +303,8 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(len(summary_payload["proposals"]), 3)
 
     def test_travel_context_stays_with_each_destination_even_if_summary_fails(self):
+        clock = self.enterContext(patch("agents.travel_window.date", wraps=date))
+        clock.today.return_value = date(2026, 6, 7)
         destinations = [
             SuggestedDestination(name="Lisbon", country="Portugal", reason="Food", match_score=90),
             SuggestedDestination(name="Tokyo", country="Japan", reason="Museums", match_score=80),
@@ -1484,6 +1490,48 @@ class WorkflowTest(unittest.TestCase):
 
         self.assertEqual(year, 2026)
 
+    def test_filtered_alternatives_reach_trace_and_summary_without_losing_offers(self):
+        reference = date(2026, 10, 23)
+        clock = self.enterContext(patch("agents.travel_window.date", wraps=date))
+        clock.today.return_value = reference
+        self.fake_flight_search.side_effect = None
+        self.fake_flight_search.return_value = [make_flight(
+            start=date(2026, 12, 5), end=date(2026, 12, 10),
+        )]
+        request = self.flight_request(time_pref=TimePreference(
+            mode="exact_dates", start_date="2026-12-05", end_date="2026-12-10",
+        ))
+        for keep_future in (False, True):
+            with self.subTest(keep_future=keep_future):
+                payload = json.loads(fake_travel_window_response(start="2026-12-05", end="2026-12-10"))
+                payload["warnings"] = ["Existing warning."]
+                payload["alternatives"] = [
+                    {"start": "2026-04-01", "end": "2026-04-06", "reason": "Spring.", "score": 85},
+                ]
+                if keep_future:
+                    payload["alternatives"].append({
+                        "start": "2027-04-01", "end": "2027-04-06", "reason": "Next spring.", "score": 85,
+                    })
+                self.fake_openrouter_call.return_value = json.dumps(payload)
+                self.fake_openrouter_call.reset_mock()
+                self.fake_summary_call.reset_mock()
+                result = self.build_proposal(request)
+                self.assertNotIsInstance(result, PlanningError)
+                self.assertEqual(result.search_status, "complete")
+                self.assertEqual(result.summary_status, "generated")
+                context = result.proposals[0].travel_context
+                self.assertEqual(len(context.alternatives), int(keep_future))
+                self.assertTrue(all(period.start >= reference for period in context.alternatives))
+                self.assertEqual(context.warnings, [
+                    "Existing warning.", "Past alternative travel periods were omitted.",
+                ])
+                window_event = next(e for e in result.trace.events if e.event_type == EventType.TRAVEL_WINDOW_EVALUATED)
+                self.assertEqual(window_event.details["warnings"], context.warnings)
+                summary_payload = json.loads(self.fake_summary_call.call_args.kwargs["messages"][1]["content"])
+                self.assertEqual(summary_payload["proposals"][0]["travel_context"], context.model_dump(mode="json"))
+                self.fake_openrouter_call.assert_called_once()
+                self.fake_summary_call.assert_called_once()
+
 
     def test_resolve_month_year_uses_next_year_for_past_month(self):
         year = resolve_month_year(
@@ -2040,6 +2088,90 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(params["check_in_date"], "2026-09-16")
         self.assertEqual(params["check_out_date"], "2026-09-20")
         self.assertEqual(params["adults"], 2)
+
+
+class TravelWindowAlternativesTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("Live HTTP disabled")))
+        self.llm = self.enterContext(patch("agents.travel_window.call_openrouter_json"))
+        self.reference = date(2026, 10, 23)
+        self.request = TripRequest(
+            origin="Rome", destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
+            time_pref=TimePreference(mode="exact_dates", start_date="2026-12-05", end_date="2026-12-10"),
+        )
+        self.destination = SuggestedDestination(name="Lisbon", reason="Test.", match_score=100)
+
+    def advice(self, *ranges):
+        payload = json.loads(fake_travel_window_response(start="2026-12-05", end="2026-12-10"))
+        payload["warnings"] = ["Existing warning."]
+        payload["alternatives"] = [
+            {"start": start, "end": end, "reason": "Alternative period.", "score": 80}
+            for start, end in ranges
+        ]
+        return TravelWindowAdvice.model_validate(payload)
+
+    def test_past_alternatives_are_removed_without_mutation_or_year_shifting(self):
+        advice = self.advice(("2026-04-01", "2026-04-06"), ("2027-04-01", "2027-04-06"))
+        original = advice.model_dump_json()
+        filtered = remove_past_alternatives(advice, self.reference)
+        self.assertIsNot(filtered, advice)
+        self.assertEqual(advice.model_dump_json(), original)
+        self.assertEqual(filtered.alternatives, advice.alternatives[1:])
+        self.assertEqual(filtered.selected_periods, advice.selected_periods)
+        self.assertEqual(filtered.rationale, advice.rationale)
+        self.assertEqual(filtered.warnings, [*advice.warnings, "Past alternative travel periods were omitted."])
+        self.llm.assert_not_called()
+
+    def test_reference_day_is_allowed_but_an_already_started_trip_is_removed(self):
+        advice = self.advice(("2026-10-22", "2026-10-28"), ("2026-10-23", "2026-10-28"))
+        filtered = remove_past_alternatives(advice, self.reference)
+        self.assertEqual([p.start for p in filtered.alternatives], [self.reference])
+
+    def test_all_past_alternatives_can_be_removed_without_losing_selected_periods(self):
+        advice = self.advice(("2026-04-01", "2026-04-06"), ("2026-10-01", "2026-10-06"))
+        filtered = remove_past_alternatives(advice, self.reference)
+        self.assertEqual(filtered.alternatives, [])
+        self.assertEqual(filtered.selected_periods, advice.selected_periods)
+        self.assertEqual(TravelWindowAdvice.model_validate_json(filtered.model_dump_json()), filtered)
+
+    def test_empty_and_future_only_alternatives_leave_advice_unchanged(self):
+        for advice in (self.advice(), self.advice(("2027-04-01", "2027-04-06"))):
+            with self.subTest(alternatives=advice.alternatives):
+                self.assertIs(remove_past_alternatives(advice, self.reference), advice)
+                self.assertEqual(advice.warnings, ["Existing warning."])
+
+    def test_filtering_twice_does_not_duplicate_the_warning(self):
+        advice = self.advice(("2026-04-01", "2026-04-06"))
+        filtered = remove_past_alternatives(advice, self.reference)
+        self.assertIs(remove_past_alternatives(filtered, self.reference), filtered)
+        self.assertEqual(filtered.warnings.count("Past alternative travel periods were omitted."), 1)
+
+    def test_evaluation_uses_the_same_explicit_reference_date_as_the_prompt(self):
+        advice = self.advice(("2026-10-22", "2026-10-28"), ("2026-10-23", "2026-10-28"))
+        self.llm.return_value = advice.model_dump_json()
+        with patch("agents.travel_window.date", wraps=date) as clock:
+            clock.today.side_effect = AssertionError("The explicit reference date must be reused.")
+            filtered = evaluate_travel_window(self.request, self.destination, reference_date=self.reference)
+        self.assertEqual([p.start for p in filtered.alternatives], [self.reference])
+        self.assertEqual(filtered.selected_periods, advice.selected_periods)
+        self.llm.assert_called_once()
+        payload = json.loads(self.llm.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["time_context"]["reference_date"], self.reference.isoformat())
+
+    def test_month_mode_keeps_future_year_alternatives_outside_the_selected_year(self):
+        self.request.time_pref = TimePreference(mode="month", month=12)
+        self.llm.return_value = self.advice(("2027-04-01", "2027-04-06")).model_dump_json()
+        filtered = evaluate_travel_window(self.request, self.destination, reference_date=self.reference)
+        self.assertEqual(filtered.selected_periods[0].start.year, 2026)
+        self.assertEqual(filtered.alternatives[0].start.year, 2027)
+        self.llm.assert_called_once()
+
+    def test_prompt_allows_future_alternatives_and_keeps_selected_date_constraints(self):
+        prompt = build_system_prompt()
+        self.assertIn("Alternative periods must start on or after time_context.reference_date", prompt)
+        self.assertIn("Alternatives may fall in a later year", prompt)
+        self.assertIn("resolved_year constrains selected_periods only", prompt)
+        self.assertIn("selected_periods must use those dates", prompt)
 
 
 class HotelOfferTest(unittest.TestCase):
