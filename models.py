@@ -263,7 +263,39 @@ class HotelOffer(Hotel):
     vibe_match_status: Literal["not_verified"] = "not_verified"
 
 
+HotelIssueField = Literal["offer", "name", "total_rate", "rate_per_night", "overall_rating"]
+HotelIssueCode = Literal["invalid_format", "missing_required", "invalid_value"]
+
+
+class HotelOfferIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=0, strict=True)
+    field: HotelIssueField
+    code: HotelIssueCode
+    action: Literal["offer_discarded", "field_ignored"]
+
+
+class HotelSearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    offers: list[HotelOffer]
+    issues: list[HotelOfferIssue] = Field(default_factory=list)
+    received_count: int = Field(ge=0, strict=True)
+    parsed_count: int = Field(ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if not len(self.offers) <= self.parsed_count <= self.received_count:
+            raise ValueError("Hotel result counts are inconsistent.")
+        if any(issue.index >= self.received_count for issue in self.issues):
+            raise ValueError("Hotel issue index is outside the received results.")
+        return self
+
+
 class EventType(StrEnum):
+    HOTEL_OFFER_ISSUE = "HOTEL_OFFER_ISSUE"
+    HOTEL_SEARCH_PARTIAL = "HOTEL_SEARCH_PARTIAL"
     SEARCH_SCOPE_REDUCED = "SEARCH_SCOPE_REDUCED"
     DESTINATIONS_RESOLVED = "DESTINATIONS_RESOLVED"
     DESTINATION_RESOLUTION_FAILED = "DESTINATION_RESOLUTION_FAILED"
@@ -281,6 +313,9 @@ class EventType(StrEnum):
 
 
 class ReasonCode(StrEnum):
+    HOTEL_OFFER_DISCARDED = "HOTEL_OFFER_DISCARDED"
+    HOTEL_FIELD_IGNORED = "HOTEL_FIELD_IGNORED"
+    HOTEL_OFFERS_DISCARDED = "HOTEL_OFFERS_DISCARDED"
     SEARCH_SCOPE_REDUCED = "SEARCH_SCOPE_REDUCED"
     SEARCH_LIMIT_REACHED = "SEARCH_LIMIT_REACHED"
     FIXED_DESTINATION_USED = "FIXED_DESTINATION_USED"
@@ -379,6 +414,7 @@ class DestinationSearchIssue(BaseModel):
     stage: Literal["location_resolution", "flight_search", "hotel_search"]
     code: ReasonCode
     message: str
+    scope: Literal["destination", "offer"] = "destination"
 
 
 class TripSearchResult(BaseModel):

@@ -1,3 +1,4 @@
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 import re
 import unicodedata
@@ -14,6 +15,7 @@ from models import (
 )
 from providers.serpapi_client import SerpAPIResponseError, search as search_serpapi
 from providers.links import parse_redirect
+from providers.location_verification import CityCountryVerifier, CountryMatch
 
 
 # The autocomplete's "airports" list also contains transport IDs such as 4GS.
@@ -21,9 +23,13 @@ AUTOCOMPLETE_LOCATION_PATTERN = r"^[A-Z0-9]{3}$"
 
 
 class FlightLocationError(ValueError):
-    def __init__(self, message: str, options: list[str] | None = None):
+    def __init__(
+        self, message: str, options: list[str] | None = None,
+        *, country_status: CountryMatch | None = None,
+    ):
         super().__init__(message)
         self.options = options or []
+        self.country_status = country_status
 
 
 def _result_items(payload: dict, *keys: str) -> list[dict]:
@@ -85,23 +91,39 @@ def _normalized_location_name(text: str) -> str:
     return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
 
 
-def _country_matches(city: dict, country: str) -> bool:
+def _country_status(city: dict, country: str) -> CountryMatch:
     expected = _normalized_location_name(country)
     label = _normalized_location_name(city["name"])
     if "," in label:
-        return label.rsplit(",", 1)[1].strip() == expected
+        suffix = label.rsplit(",", 1)[1].strip()
+        if not suffix:
+            return CountryMatch.UNKNOWN
+        return CountryMatch.MATCH if suffix == expected else CountryMatch.MISMATCH
 
     description = city.get("description")
     if not isinstance(description, str):
-        return False
+        return CountryMatch.UNKNOWN
     # Autocomplete uses hl=en; only explicit country descriptions are accepted.
     description = _normalized_location_name(description).rstrip(".")
-    return description in {
-        f"city in {expected}",
-        f"town in {expected}",
-        f"capital of {expected}",
-        f"municipality in {expected}",
-    }
+    for prefix in ("city in ", "town in ", "capital of ", "municipality in "):
+        if description.startswith(prefix):
+            place = description[len(prefix):].strip()
+            if place:
+                # A different or more specific place is not permission to override it.
+                return CountryMatch.MATCH if place == expected else CountryMatch.MISMATCH
+    return CountryMatch.UNKNOWN
+
+
+def _unresolved_city(
+    cities: list[dict], name: str, country: str | None,
+    *, country_status: CountryMatch | None = None,
+) -> FlightLocationError:
+    text = ", ".join(filter(None, [name, country]))
+    return FlightLocationError(
+        f"Location unresolved: {text!r}. Specify the city and country or select a verified city_id.",
+        options=[f"{city['name']} ({city['id']})" for city in cities],
+        country_status=country_status,
+    )
 
 
 def select_city_candidate(
@@ -110,33 +132,36 @@ def select_city_candidate(
 ) -> dict:
     wanted = _normalized_location_name(name)
     matches = []
+    rejected_country = False
     for city in cities:
         label = _normalized_location_name(city["name"])
         if city_id is not None:
             compatible = city["id"] == city_id
         elif country is not None:
-            compatible = (
-                label.split(",")[0].strip() == wanted
-                and _country_matches(city, country)
-            )
+            compatible = label.split(",")[0].strip() == wanted
         else:
             compatible = label == wanted or (
                 "," not in wanted and label.split(",")[0].strip() == wanted
             )
+        if compatible and country is not None and _country_status(city, country) is CountryMatch.MISMATCH:
+            rejected_country = True
+            compatible = False
         if compatible:
             matches.append(city)
     if len(matches) != 1:
-        text = ", ".join(filter(None, [name, country]))
-        raise FlightLocationError(
-            f"Location unresolved: {text!r}. Specify the city and country or select a verified city_id.",
-            options=[f"{city['name']} ({city['id']})" for city in cities],
+        raise _unresolved_city(
+            cities, name, country,
+            country_status=CountryMatch.MISMATCH if not matches and rejected_country else None,
         )
+    if country is not None and city_id is None and _country_status(matches[0], country) is CountryMatch.UNKNOWN:
+        raise _unresolved_city(cities, name, country, country_status=CountryMatch.UNKNOWN)
     return matches[0]
 
 
 def resolve_city(
     text: str, *, country: str | None = None,
     city_id: str | None = None, budget: RunBudget | None = None,
+    verifier: CityCountryVerifier | None = None,
 ) -> dict:
     name = text.strip()
     if country is not None:
@@ -149,7 +174,26 @@ def resolve_city(
 
     query = f"{name}, {country}" if country is not None else name
     cities = find_city_options(query, budget=budget)
-    return select_city_candidate(cities, name, country=country, city_id=city_id)
+    try:
+        return select_city_candidate(cities, name, country=country, city_id=city_id)
+    except FlightLocationError as error:
+        if (
+            verifier is None or country is None or city_id is not None
+            or error.country_status is not CountryMatch.UNKNOWN
+        ):
+            raise
+        # The pure selector reports UNKNOWN only for a single eligible candidate.
+        candidate = next(
+            city for city in cities
+            if _normalized_location_name(city["name"]).split(",")[0].strip() == _normalized_location_name(name)
+            and _country_status(city, country) is CountryMatch.UNKNOWN
+        )
+        status = verifier.verify(deepcopy(candidate), country, budget=budget)
+        if not isinstance(status, CountryMatch):
+            raise TypeError("The country verifier must return CountryMatch.")
+        if status is CountryMatch.MATCH:
+            return candidate
+        raise _unresolved_city(cities, name, country, country_status=status) from None
 
 
 def search_id_for(city: dict, airport_code: str | None = None) -> str:

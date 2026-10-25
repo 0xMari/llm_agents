@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from models import FlightSearchQuery, HotelSearchQuery
 from providers.flights import FlightLocationError, resolve_city, search_flights, search_id_for
 from providers.hotels import search_hotels
-from providers.serpapi_client import SerpAPIError
+from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
 
 
 def main(argv=None):
@@ -47,11 +47,16 @@ def main(argv=None):
     if checkout <= checkin:
         print("The first offer does not allow an overnight stay.")
         return
-    hotels = search_hotels(HotelSearchQuery(
+    hotel_result = search_hotels(HotelSearchQuery(
         destination=query.destination,
         location_name=destination_city["name"],
         checkin_date=checkin, checkout_date=checkout, adults=query.adults,
     ))
+    for issue in hotel_result.issues:
+        print("Hotel issue:", issue.model_dump_json())
+    if hotel_result.received_count and not hotel_result.parsed_count:
+        raise SerpAPIResponseError("None of the hotel offers could be used.", kind="all_hotel_offers_invalid")
+    hotels = hotel_result.offers
     print("Hotel offers found:", len(hotels))
     for hotel in hotels[:3]:
         print(hotel.model_dump_json(indent=2))

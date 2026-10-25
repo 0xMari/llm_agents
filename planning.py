@@ -10,6 +10,7 @@ from agents.proposal_summary import InvalidProposalSummary, summarize_proposals
 
 from providers.flights import FlightLocationError, resolve_city, search_flights, search_id_for
 from providers.hotels import search_hotels
+from providers.location_verification import CityCountryVerifier
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
 
 from scoring import select_final_proposals
@@ -22,6 +23,7 @@ from models import (
     EventType,
     FlightSearchQuery,
     HotelSearchQuery,
+    HotelSearchResult,
     PlanningError,
     ProposalComment,
     ProposalTravelContext,
@@ -70,6 +72,8 @@ def flight_search_failure(
         reason = ReasonCode.FLIGHT_LOCATION_UNRESOLVED
         message = str(error)
         details["location_options"] = error.options
+        if error.country_status is not None:
+            details["country_status"] = error.country_status.value
     elif isinstance(error, SerpAPIResponseError):
         reason = ReasonCode.FLIGHT_OUTPUT_INVALID
         details["response_error_kind"] = error.kind
@@ -129,11 +133,49 @@ def record_destination_issue(
     ))
 
 
-def build_proposal(request: TripRequest, *, limits: SearchLimits) -> TripSearchResult | PlanningError:
+def record_hotel_issues(
+    events: list[DecisionEvent], issues: list[DestinationSearchIssue],
+    destination: SuggestedDestination, query: HotelSearchQuery, result: HotelSearchResult,
+) -> None:
+    for issue in result.issues:
+        discarded = issue.action == "offer_discarded"
+        events.append(DecisionEvent(
+            event_type=EventType.HOTEL_OFFER_ISSUE,
+            reason_code=ReasonCode.HOTEL_OFFER_DISCARDED if discarded else ReasonCode.HOTEL_FIELD_IGNORED,
+            details={
+                "destination": destination.name, "location_name": query.location_name,
+                "checkin_date": query.checkin_date.isoformat(), "checkout_date": query.checkout_date.isoformat(),
+                "scope": "offer", "offer_index": issue.index, "field": issue.field,
+                "issue_code": issue.code, "action": issue.action,
+            },
+            comment="An unusable hotel offer was discarded." if discarded else "An invalid optional hotel field was omitted.",
+        ))
+    discarded_count = sum(issue.action == "offer_discarded" for issue in result.issues)
+    if discarded_count and result.parsed_count:
+        message = "Some hotel offers were discarded; valid offers remain usable."
+        issues.append(DestinationSearchIssue(
+            destination=destination.name, country=destination.country, stage="hotel_search",
+            code=ReasonCode.HOTEL_OFFERS_DISCARDED, message=message, scope="offer",
+        ))
+        events.append(DecisionEvent(
+            event_type=EventType.HOTEL_SEARCH_PARTIAL, reason_code=ReasonCode.HOTEL_OFFERS_DISCARDED,
+            details={
+                "destination": destination.name, "scope": "offer", "stage": "hotel_search",
+                "received_count": result.received_count, "parsed_count": result.parsed_count,
+                "returned_count": len(result.offers), "discarded_count": discarded_count,
+            },
+            comment=message,
+        ))
+
+
+def build_proposal(
+    request: TripRequest, *, limits: SearchLimits,
+    country_verifier: CityCountryVerifier | None = None,
+) -> TripSearchResult | PlanningError:
     budget = RunBudget(limits)
     events = []
     try:
-        result = _build_proposal(request, budget=budget, events=events)
+        result = _build_proposal(request, budget=budget, events=events, country_verifier=country_verifier)
     except SearchLimitExceeded as error:
         message = "Search stopped: the configured call limit was reached."
         events.append(DecisionEvent(
@@ -178,6 +220,7 @@ def record_scope_reduction(
 
 def _build_proposal(
     request: TripRequest, *, budget: RunBudget, events: list[DecisionEvent],
+    country_verifier: CityCountryVerifier | None = None,
 ) -> TripSearchResult | PlanningError:
     limits = budget.limits
     scenario = route_request(request)
@@ -189,6 +232,7 @@ def _build_proposal(
     hotel_cache = {}
     failed_hotel_stays = set()
     search_issues = []
+    verification_options = {"verifier": country_verifier} if country_verifier is not None else {}
 
     events.append(
         DecisionEvent(
@@ -312,6 +356,7 @@ def _build_proposal(
                         country=destination.country if location_index == 1 else None,
                         city_id=city_id,
                         budget=budget,
+                        **verification_options,
                     )
                 search_ids.append(search_id_for(city_cache[key], airport_code))
         except (SerpAPIError, FlightLocationError) as error:
@@ -400,7 +445,13 @@ def _build_proposal(
                     continue
                 if stay_key not in hotel_cache:
                     try:
-                        hotel_cache[stay_key] = search_hotels(hotel_query, budget=budget)
+                        hotel_result = search_hotels(hotel_query, budget=budget)
+                        record_hotel_issues(events, search_issues, destination, hotel_query, hotel_result)
+                        if hotel_result.received_count and not hotel_result.parsed_count:
+                            raise SerpAPIResponseError(
+                                "None of the received hotel offers could be used.", kind="all_hotel_offers_invalid",
+                            )
+                        hotel_cache[stay_key] = hotel_result
                     except SerpAPIError as error:
                         failure = hotel_search_failure(events, hotel_query, error)
                         if request.destination_pref.mode == "open" and isinstance(error, SerpAPIResponseError):
@@ -408,7 +459,7 @@ def _build_proposal(
                             record_destination_issue(events, search_issues, destination, failure, "hotel_search")
                             continue
                         return failure
-                hotels = hotel_cache[stay_key]
+                hotels = hotel_cache[stay_key].offers
 
                 if not hotels:
                     events.append(
@@ -518,12 +569,13 @@ def _build_proposal(
                     )
 
     if not proposals:
-        if search_issues:
-            reason = search_issues[0].code
+        failed_destinations = [issue for issue in search_issues if issue.scope == "destination"]
+        if failed_destinations:
+            reason = failed_destinations[0].code
             message = "No usable proposals: some destination searches could not be completed."
             events.append(DecisionEvent(
                 event_type=EventType.SEARCH_FAILED, reason_code=reason,
-                details={"affected_destinations": list(dict.fromkeys(issue.destination for issue in search_issues))},
+                details={"affected_destinations": list(dict.fromkeys(issue.destination for issue in failed_destinations))},
                 comment=message,
             ))
             return PlanningError(code=reason.value, message=message, trace=DecisionTrace(events=events))

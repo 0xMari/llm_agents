@@ -1,4 +1,5 @@
 import contextlib
+from copy import deepcopy
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 import io
@@ -7,14 +8,16 @@ import os
 from pathlib import Path
 import runpy
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pydantic import ValidationError
 from requests.exceptions import Timeout
 
-from models import DestinationPreference, FlightOffer, FlightSearchQuery
+from execution import RunBudget, SearchLimits
+from models import DestinationPreference, FlightOffer, FlightSearchQuery, HotelSearchResult
 from providers.flights import (
     FlightLocationError,
+    _country_status,
     find_city_options,
     parse_flight_leg,
     resolve_city,
@@ -22,6 +25,7 @@ from providers.flights import (
     search_flights,
     search_id_for,
 )
+from providers.location_verification import CountryMatch
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError, search
 
 
@@ -70,6 +74,11 @@ def supplied_valencia_autocomplete():
     # User-supplied autocomplete fields; city type is restored from the filtered output.
     path = Path(__file__).resolve().parent / "fixtures" / "serpapi" / "autocomplete_valencia.json"
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def supplied_naples_city():
+    # Fields printed in the user's diagnostic, not a complete HTTP capture.
+    return {"name": "Naples", "id": "/g/1233f22n", "type": "city", "description": None}
 
 
 def fake_flight_search(query, *, max_outbound=3, budget=None):
@@ -297,6 +306,161 @@ class FlightProviderTest(unittest.TestCase):
                 self.assertEqual(select_city_candidate([city], "Florence", country="Italy"), city)
         self.api.assert_not_called()
 
+    def test_country_evidence_distinguishes_match_mismatch_and_unknown(self):
+        for name, description, expected in (
+            ("Naples, Italy", None, CountryMatch.MATCH),
+            ("Naples, USA", "City in Italy", CountryMatch.MISMATCH),
+            ("Naples", " City in ITALY. ", CountryMatch.MATCH),
+            ("Naples", "City in USA", CountryMatch.MISMATCH),
+            ("Naples", "City in Campania", CountryMatch.MISMATCH),
+            ("Naples", "City in Italy and France", CountryMatch.MISMATCH),
+            ("Naples", None, CountryMatch.UNKNOWN),
+            ("Naples", "", CountryMatch.UNKNOWN),
+            ("Naples", {}, CountryMatch.UNKNOWN),
+            ("Naples", "City in ", CountryMatch.UNKNOWN),
+            ("Naples", "Historic city", CountryMatch.UNKNOWN),
+        ):
+            with self.subTest(name=name, description=description):
+                city = {**supplied_naples_city(), "name": name, "description": description}
+                self.assertIs(_country_status(city, "Italy"), expected)
+        self.api.assert_not_called()
+
+    def test_supplied_naples_stays_unresolved_without_country_evidence(self):
+        city = supplied_naples_city()
+        self.api.return_value = {"suggestions": [city]}
+        with self.assertRaises(FlightLocationError) as caught:
+            resolve_city("Naples, Italy", country="Italy")
+        self.assertIs(caught.exception.country_status, CountryMatch.UNKNOWN)
+        self.assertEqual(caught.exception.options, ["Naples (/g/1233f22n)"])
+        self.api.assert_called_once()
+        self.assertEqual(self.api.call_args.args[0]["q"], "Naples, Italy")
+
+    def test_verifier_can_confirm_only_a_unique_unknown_candidate(self):
+        city = supplied_naples_city()
+        self.api.return_value = {"suggestions": [city]}
+        verifier = Mock()
+        verifier.verify.return_value = CountryMatch.MATCH
+        budget = RunBudget(SearchLimits())
+        resolved = resolve_city(" Naples, Italy ", country=" Italy ", verifier=verifier, budget=budget)
+        self.assertIs(resolved, city)
+        verifier.verify.assert_called_once_with(city, "Italy", budget=budget)
+        self.assertIsNot(verifier.verify.call_args.args[0], city)
+        self.api.assert_called_once()
+
+    def test_verifier_cannot_mutate_the_selected_candidate(self):
+        city = {**supplied_naples_city(), "airports": [{"id": "NAP"}]}
+        original = deepcopy(city)
+        self.api.return_value = {"suggestions": [city]}
+        verifier = Mock()
+
+        def verify(candidate, expected_country, *, budget):
+            candidate["id"] = "/m/other_city"
+            candidate["airports"][0]["id"] = "FCO"
+            return CountryMatch.MATCH
+
+        verifier.verify.side_effect = verify
+        self.assertEqual(resolve_city("Naples", country="Italy", verifier=verifier), original)
+        self.assertEqual(city, original)
+
+    def test_inconclusive_or_negative_verification_does_not_resolve_the_city(self):
+        self.api.return_value = {"suggestions": [supplied_naples_city()]}
+        for status in (CountryMatch.UNKNOWN, CountryMatch.MISMATCH):
+            with self.subTest(status=status):
+                verifier = Mock()
+                verifier.verify.return_value = status
+                with self.assertRaises(FlightLocationError) as caught:
+                    resolve_city("Naples", country="Italy", verifier=verifier)
+                self.assertIs(caught.exception.country_status, status)
+                self.assertEqual(caught.exception.options, ["Naples (/g/1233f22n)"])
+                verifier.verify.assert_called_once()
+
+    def test_verifier_is_not_used_for_confirmed_or_explicitly_selected_cities(self):
+        for city, kwargs in (
+            ({**supplied_naples_city(), "name": "Naples, Italy"}, {"country": "Italy"}),
+            ({**supplied_naples_city(), "description": "City in Italy"}, {"country": "Italy"}),
+            (supplied_naples_city(), {"country": "Italy", "city_id": "/g/1233f22n"}),
+            (supplied_naples_city(), {}),
+        ):
+            with self.subTest(city=city, kwargs=kwargs):
+                self.api.return_value = {"suggestions": [city]}
+                verifier = Mock()
+                self.assertEqual(resolve_city("Naples", verifier=verifier, **kwargs), city)
+                verifier.verify.assert_not_called()
+
+    def test_country_conflicts_cannot_be_overridden_by_verifier_or_explicit_id(self):
+        for city in (
+            {**supplied_naples_city(), "name": "Naples, USA"},
+            {**supplied_naples_city(), "description": "City in USA"},
+        ):
+            for city_id in (None, city["id"]):
+                with self.subTest(city=city, city_id=city_id):
+                    self.api.return_value = {"suggestions": [city]}
+                    verifier = Mock()
+                    verifier.verify.return_value = CountryMatch.MATCH
+                    with self.assertRaises(FlightLocationError) as caught:
+                        resolve_city("Naples", country="Italy", city_id=city_id, verifier=verifier)
+                    self.assertIs(caught.exception.country_status, CountryMatch.MISMATCH)
+                    verifier.verify.assert_not_called()
+
+    def test_ambiguous_candidates_never_trigger_verification(self):
+        city = supplied_naples_city()
+        for other in (
+            {**city, "id": "/m/test_naples"},
+            {**city, "id": "/m/test_naples", "description": "City in Italy"},
+        ):
+            with self.subTest(other=other):
+                self.api.return_value = {"suggestions": [city, other]}
+                verifier = Mock()
+                verifier.verify.return_value = CountryMatch.MATCH
+                with self.assertRaises(FlightLocationError) as caught:
+                    resolve_city("Naples", country="Italy", verifier=verifier)
+                self.assertIsNone(caught.exception.country_status)
+                self.assertEqual(len(caught.exception.options), 2)
+                verifier.verify.assert_not_called()
+
+    def test_wrong_name_missing_city_and_unknown_explicit_id_do_not_trigger_verification(self):
+        for cities, city_id in (
+            ([], None),
+            ([fake_city("Rome, Italy")], None),
+            ([supplied_naples_city()], "/m/not_returned"),
+        ):
+            with self.subTest(cities=cities, city_id=city_id):
+                self.api.return_value = {"suggestions": cities}
+                verifier = Mock()
+                with self.assertRaises(FlightLocationError):
+                    resolve_city("Naples", country="Italy", city_id=city_id, verifier=verifier)
+                verifier.verify.assert_not_called()
+
+    def test_wrong_country_candidates_do_not_prevent_verification_of_one_unknown_city(self):
+        city = supplied_naples_city()
+        self.api.return_value = {"suggestions": [
+            {**city, "name": "Naples, USA", "id": "/m/test_us_naples"}, city,
+        ]}
+        verifier = Mock()
+        verifier.verify.return_value = CountryMatch.MATCH
+        self.assertIs(resolve_city("Naples", country="Italy", verifier=verifier), city)
+        verifier.verify.assert_called_once_with(city, "Italy", budget=None)
+
+    def test_invalid_verifier_results_do_not_authorize_a_city(self):
+        self.api.return_value = {"suggestions": [supplied_naples_city()]}
+        for value in ("match", True, None, {"status": "match"}):
+            with self.subTest(value=value):
+                verifier = Mock()
+                verifier.verify.return_value = value
+                with self.assertRaisesRegex(TypeError, "must return CountryMatch"):
+                    resolve_city("Naples", country="Italy", verifier=verifier)
+
+    def test_verifier_errors_propagate_without_acceptance_or_retry(self):
+        self.api.return_value = {"suggestions": [supplied_naples_city()]}
+        for error in (SerpAPIError("Timeout", code="TIMEOUT"), RuntimeError("Verifier bug")):
+            with self.subTest(error=error):
+                verifier = Mock()
+                verifier.verify.side_effect = error
+                with self.assertRaises(type(error)) as caught:
+                    resolve_city("Naples", country="Italy", verifier=verifier)
+                self.assertIs(caught.exception, error)
+                verifier.verify.assert_called_once()
+
     def test_country_is_not_inferred_from_query_or_regional_description(self):
         for description in (None, "", {}, "City in Tuscany", "City in Italy and France", "City in USA"):
             with self.subTest(description=description):
@@ -439,7 +603,7 @@ class FlightProviderTest(unittest.TestCase):
 
         with patch("try_serpapi.resolve_city", side_effect=fake_city), patch(
             "try_serpapi.search_flights", return_value=[make_flight()]
-        ) as flights, patch("try_serpapi.search_hotels", return_value=[]) as hotels:
+        ) as flights, patch("try_serpapi.search_hotels", return_value=HotelSearchResult(offers=[], received_count=0, parsed_count=0)) as hotels:
             with contextlib.redirect_stdout(io.StringIO()):
                 try_serpapi.main(["--origin", "Milan, Italy", "--origin-airport", "LIN"])
             query = flights.call_args.args[0]

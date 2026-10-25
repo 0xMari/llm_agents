@@ -23,6 +23,7 @@ class SerpAPIResponseError(SerpAPIError):
             "invalid_status", "missing_results", "invalid_results", "invalid_city",
             "invalid_city_locations", "invalid_flight_leg", "flight_date_mismatch",
             "flight_airport_mismatch", "missing_departure_token", "invalid_flight_offer",
+            "invalid_hotel_results", "missing_hotel_results", "all_hotel_offers_invalid",
         }
         self.kind = kind if isinstance(kind, str) and kind in allowed else "invalid_response"
 

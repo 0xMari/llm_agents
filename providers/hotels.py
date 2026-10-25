@@ -4,7 +4,10 @@ from pydantic import ValidationError
 
 from execution import RunBudget
 
-from models import HotelCoordinates, HotelDetails, HotelImage, HotelOffer, HotelSearchQuery
+from models import (
+    HotelCoordinates, HotelDetails, HotelImage, HotelIssueCode, HotelIssueField,
+    HotelOffer, HotelOfferIssue, HotelSearchQuery, HotelSearchResult,
+)
 from providers.links import parse_public_url, parse_redirect
 from providers.serpapi_client import SerpAPIResponseError, search as search_serpapi
 
@@ -68,36 +71,84 @@ def _parse_details(raw_hotel: dict) -> HotelDetails:
     )
 
 
+class HotelOfferParseError(ValueError):
+    def __init__(self, *, field: HotelIssueField, code: HotelIssueCode):
+        super().__init__(f"Hotel offer cannot be used: {field} ({code}).")
+        self.field = field
+        self.code = code
+
+
+def _amount(value: object) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ValueError("Invalid amount type.")
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("Invalid amount value.")
+    return amount
+
+
 def parse_hotel_offer(
-    raw_hotel: dict, query: HotelSearchQuery, *, search_url: object = None
-) -> HotelOffer:
+    raw_hotel: object, query: HotelSearchQuery, *, index: int = 0, search_url: object = None,
+) -> tuple[HotelOffer, list[HotelOfferIssue]]:
+    query.validate_stay_dates()
     if not isinstance(raw_hotel, dict):
-        raise SerpAPIResponseError("Invalid hotel format.")
+        raise HotelOfferParseError(field="offer", code="invalid_format")
+    raw_name = raw_hotel.get("name")
+    name = _optional_text(raw_name)
+    if name is None:
+        raise HotelOfferParseError(
+            field="name", code="missing_required" if raw_name is None or isinstance(raw_name, str) else "invalid_value",
+        )
     total_rate = raw_hotel.get("total_rate")
-    if not isinstance(total_rate, dict) or total_rate.get("extracted_lowest") is None:
-        raise SerpAPIResponseError("The hotel has no usable total price.")
+    if total_rate is None:
+        raise HotelOfferParseError(field="total_rate", code="missing_required")
+    if not isinstance(total_rate, dict):
+        raise HotelOfferParseError(field="total_rate", code="invalid_format")
+    if total_rate.get("extracted_lowest") is None:
+        raise HotelOfferParseError(field="total_rate", code="missing_required")
+    try:
+        total_price = _amount(total_rate["extracted_lowest"])
+    except (ValueError, InvalidOperation):
+        raise HotelOfferParseError(field="total_rate", code="invalid_value") from None
+
+    issues = []
+
+    def ignored(field: HotelIssueField, code: HotelIssueCode = "invalid_value") -> None:
+        issues.append(HotelOfferIssue(index=index, field=field, code=code, action="field_ignored"))
+
+    nightly_price = None
     nightly_rate = raw_hotel.get("rate_per_night")
     if nightly_rate is not None and not isinstance(nightly_rate, dict):
-        raise SerpAPIResponseError("Invalid nightly price format.")
-    nightly_price = nightly_rate.get("extracted_lowest") if nightly_rate else None
-    try:
-        return HotelOffer(
-            destination=query.destination,
-            name=raw_hotel["name"].strip(),
-            nightly_price_eur=Decimal(str(nightly_price)) if nightly_price is not None else None,
-            rating=raw_hotel.get("overall_rating"),
-            nights=(query.checkout_date - query.checkin_date).days,
-            total_price_eur=Decimal(str(total_rate["extracted_lowest"])),
-            redirect=parse_redirect(raw_hotel.get("link"), kind="property_website"),
-            search_redirect=parse_redirect(search_url, kind="hotel_search"),
-            property_token=_optional_text(raw_hotel.get("property_token")),
-            details=_parse_details(raw_hotel),
-        )
-    except (KeyError, AttributeError, TypeError, ValueError, InvalidOperation):
-        raise SerpAPIResponseError("Invalid hotel offer prices or data.") from None
+        ignored("rate_per_night", "invalid_format")
+    elif nightly_rate and nightly_rate.get("extracted_lowest") is not None:
+        try:
+            nightly_price = _amount(nightly_rate["extracted_lowest"])
+        except (ValueError, InvalidOperation):
+            ignored("rate_per_night")
+
+    rating = None
+    if raw_hotel.get("overall_rating") is not None:
+        try:
+            amount = _amount(raw_hotel["overall_rating"])
+            if amount > 5:
+                raise ValueError("Rating out of range.")
+            rating = float(amount)
+        except (ValueError, InvalidOperation):
+            ignored("overall_rating")
+
+    return HotelOffer(
+        destination=query.destination, name=name,
+        nightly_price_eur=nightly_price, rating=rating,
+        nights=(query.checkout_date - query.checkin_date).days,
+        total_price_eur=total_price,
+        redirect=parse_redirect(raw_hotel.get("link"), kind="property_website"),
+        search_redirect=parse_redirect(search_url, kind="hotel_search"),
+        property_token=_optional_text(raw_hotel.get("property_token")),
+        details=_parse_details(raw_hotel),
+    ), issues
 
 
-def search_hotels(query: HotelSearchQuery, *, budget: RunBudget | None = None) -> list[HotelOffer]:
+def search_hotels(query: HotelSearchQuery, *, budget: RunBudget | None = None) -> HotelSearchResult:
     query.validate_stay_dates()
     response = search_serpapi({
         "engine": "google_hotels",
@@ -109,17 +160,29 @@ def search_hotels(query: HotelSearchQuery, *, budget: RunBudget | None = None) -
     }, budget=budget)
     metadata = response.get("search_metadata")
     search_url = metadata.get("google_hotels_url") if isinstance(metadata, dict) else None
-    offers = [parse_hotel_offer(item, query, search_url=search_url) for item in _hotel_results(response)]
+    items = _hotel_results(response)
+    offers, issues = [], []
+    for index, item in enumerate(items):
+        try:
+            offer, field_issues = parse_hotel_offer(item, query, index=index, search_url=search_url)
+        except HotelOfferParseError as error:
+            issues.append(HotelOfferIssue(
+                index=index, field=error.field, code=error.code, action="offer_discarded",
+            ))
+            continue
+        offers.append(offer)
+        issues.extend(field_issues)
+    parsed_count = len(offers)
     if query.max_total_price_eur is not None:
         offers = [offer for offer in offers if offer.total_price_eur <= query.max_total_price_eur]
-    return offers
+    return HotelSearchResult(offers=offers, issues=issues, received_count=len(items), parsed_count=parsed_count)
 
 
-def _hotel_results(response: dict) -> list[dict]:
+def _hotel_results(response: dict) -> list[object]:
     if "properties" in response:
         items = response["properties"]
-        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
-            raise SerpAPIResponseError("Unexpected hotel result format.")
+        if not isinstance(items, list):
+            raise SerpAPIResponseError("Unexpected hotel result format.", kind="invalid_hotel_results")
         return items
     information = response.get("search_information")
     if isinstance(information, dict) and information.get("hotels_results_state") == "Showing results for property details":
@@ -127,4 +190,4 @@ def _hotel_results(response: dict) -> list[dict]:
     metadata = response.get("search_metadata", {})
     if isinstance(metadata, dict) and metadata.get("status") == "Success" and response.get("error"):
         return []
-    raise SerpAPIResponseError("The response does not contain the expected hotel results.")
+    raise SerpAPIResponseError("The response does not contain the expected hotel results.", kind="missing_hotel_results")

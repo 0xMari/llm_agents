@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from models import HotelOffer, HotelSearchQuery
-from providers.hotels import parse_hotel_offer, search_hotels
+from models import HotelOffer, HotelOfferIssue, HotelSearchQuery, HotelSearchResult
+from providers.hotels import HotelOfferParseError, parse_hotel_offer, search_hotels
 from providers.links import parse_redirect
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
 
@@ -52,18 +52,22 @@ def detailed_raw_hotel(**kwargs):
     }
 
 
+def hotel_search_result(offers):
+    return HotelSearchResult(offers=offers, received_count=len(offers), parsed_count=len(offers))
+
+
 def fake_hotel_search(query, *, budget=None):
     if query.destination != "Lisbon":
-        return []
+        return hotel_search_result([])
     nights = (query.checkout_date - query.checkin_date).days
-    return [
+    return hotel_search_result([
         HotelOffer(
             destination=query.destination, name=name,
             nightly_price_eur=rate, rating=rating, nights=nights,
             total_price_eur=rate * nights,
         )
         for name, rate, rating in [("Central Stay", 95, 4.4), ("Simple Rooms", 62, 3.9)]
-    ]
+    ])
 
 
 class HotelProviderTest(unittest.TestCase):
@@ -77,7 +81,7 @@ class HotelProviderTest(unittest.TestCase):
         )
 
     def test_request_uses_verified_location_dates_currency_and_guests(self):
-        hotels = search_hotels(self.query)
+        hotels = search_hotels(self.query).offers
         self.api.assert_called_once_with({
             "engine": "google_hotels", "q": "Hotels in Lisbon, Portugal",
             "check_in_date": "2026-09-15", "check_out_date": "2026-09-20",
@@ -89,13 +93,13 @@ class HotelProviderTest(unittest.TestCase):
         self.assertEqual(hotels[0].total_price_eur, Decimal("249.99"))
 
     def test_total_is_not_multiplied_by_nights_or_guests(self):
-        hotel = search_hotels(self.query)[0]
+        hotel = search_hotels(self.query).offers[0]
         self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
         self.assertNotEqual(hotel.total_price_eur, hotel.nightly_price_eur * hotel.nights)
 
     def test_price_filter_uses_explicit_stay_total_locally(self):
         self.api.return_value = {"properties": [raw_hotel(total="250"), raw_hotel(total="250.01")]}
-        hotels = search_hotels(self.query.model_copy(update={"max_total_price_eur": 250}))
+        hotels = search_hotels(self.query.model_copy(update={"max_total_price_eur": 250})).offers
         self.assertEqual([hotel.total_price_eur for hotel in hotels], [Decimal("250")])
         self.assertNotIn("max_price", self.api.call_args.args[0])
 
@@ -106,10 +110,10 @@ class HotelProviderTest(unittest.TestCase):
         ):
             with self.subTest(response=response):
                 self.api.return_value = response
-                self.assertEqual(search_hotels(self.query), [])
+                self.assertEqual(search_hotels(self.query), hotel_search_result([]))
 
     def test_missing_or_malformed_results_are_errors(self):
-        for response in ({}, {"properties": None}, {"properties": {}}, {"properties": [None]},
+        for response in ({}, {"properties": None}, {"properties": {}},
                          {"error": "Service failed"}, {"non_matching_properties": [raw_hotel()]}):
             with self.subTest(response=response):
                 self.api.return_value = response
@@ -121,7 +125,7 @@ class HotelProviderTest(unittest.TestCase):
             **raw_hotel(),
             "search_information": {"hotels_results_state": "Showing results for property details"},
         }
-        self.assertEqual(search_hotels(self.query)[0].name, "Test Stay")
+        self.assertEqual(search_hotels(self.query).offers[0].name, "Test Stay")
 
     def test_non_matching_and_sponsored_results_are_not_mixed_in(self):
         self.api.return_value = {
@@ -129,7 +133,7 @@ class HotelProviderTest(unittest.TestCase):
             "non_matching_properties": [raw_hotel(name="Not matching")],
             "ads": [raw_hotel(name="Advertisement")],
         }
-        self.assertEqual([hotel.name for hotel in search_hotels(self.query)], ["Test Stay"])
+        self.assertEqual([hotel.name for hotel in search_hotels(self.query).offers], ["Test Stay"])
 
     def test_search_is_bounded_to_one_page(self):
         self.api.return_value["serpapi_pagination"] = {"next_page_token": "next-page"}
@@ -144,27 +148,31 @@ class HotelProviderTest(unittest.TestCase):
                     search_hotels(self.query)
                 self.assertIs(caught.exception, error)
 
-    def test_missing_total_fails_instead_of_inventing_a_price(self):
+    def test_missing_total_is_reported_instead_of_inventing_a_price(self):
         self.api.return_value = {"properties": [raw_hotel(total=None)]}
-        with self.assertRaises(SerpAPIResponseError):
-            search_hotels(self.query)
+        result = search_hotels(self.query)
+        self.assertEqual(result.offers, [])
+        self.assertEqual(result.parsed_count, 0)
+        self.assertEqual(result.received_count, 1)
+        self.assertEqual(result.issues, [HotelOfferIssue(
+            index=0, field="total_rate", code="missing_required", action="offer_discarded",
+        )])
 
     def test_missing_optional_rating_and_nightly_rate_are_not_fabricated(self):
         self.api.return_value = {"properties": [{"name": "No review yet", "total_rate": {"extracted_lowest": 100}}]}
-        hotel = search_hotels(self.query)[0]
+        hotel = search_hotels(self.query).offers[0]
         self.assertIsNone(hotel.rating)
         self.assertIsNone(hotel.nightly_price_eur)
         self.assertIsNone(hotel.redirect)
         self.assertEqual(hotel.total_price_eur, 100)
 
-    def test_malformed_hotel_fields_have_a_provider_exception(self):
+    def test_malformed_required_hotel_fields_have_a_typed_parse_exception(self):
         for fields in (
-            {"name": None}, {"name": " "}, {"name": 123}, {"overall_rating": "bad"},
-            {"overall_rating": 6}, {"overall_rating": "NaN"}, {"rate_per_night": []},
+            {"name": None}, {"name": " "}, {"name": 123},
             {"total_rate": {"extracted_lowest": "unknown"}},
         ):
             with self.subTest(fields=fields):
-                with self.assertRaises(SerpAPIResponseError):
+                with self.assertRaises(HotelOfferParseError):
                     parse_hotel_offer({**raw_hotel(), **fields}, self.query)
 
     def test_invalid_query_fails_before_the_network(self):
@@ -186,7 +194,7 @@ class HotelProviderTest(unittest.TestCase):
         self.assertEqual(payload, original)
 
     def test_public_website_has_explicit_redirect_kind(self):
-        hotel = search_hotels(self.query)[0]
+        hotel = search_hotels(self.query).offers[0]
         self.assertEqual(hotel.redirect.kind, "property_website")
         self.assertEqual(hotel.redirect.label, "Open property page")
         self.assertEqual(hotel.model_dump(mode="json")["redirect"]["url"], "https://hotel.example/stay")
@@ -196,14 +204,14 @@ class HotelProviderTest(unittest.TestCase):
             "search_metadata": {"google_hotels_url": "https://www.google.com/_/TravelFrontendUi/data/batchexecute"},
             "properties": [{**raw_hotel(), "link": None, "serpapi_property_details_link": "https://serpapi.com/search.json?property_token=test"}],
         }
-        offer = search_hotels(self.query)[0]
+        offer = search_hotels(self.query).offers[0]
         self.assertIsNone(offer.redirect)
         self.assertIsNone(offer.search_redirect)
 
     def test_available_details_and_token_are_preserved_without_extra_requests(self):
         raw = detailed_raw_hotel()
         self.api.return_value = {"properties": [raw]}
-        hotel = search_hotels(self.query)[0]
+        hotel = search_hotels(self.query).offers[0]
         self.api.assert_called_once()
         self.assertEqual(hotel.property_token, "test-property-token")
         self.assertEqual(hotel.rating, 4.4)
@@ -230,14 +238,14 @@ class HotelProviderTest(unittest.TestCase):
             **detailed_raw_hotel(),
             "search_information": {"hotels_results_state": "Showing results for property details"},
         }
-        hotel = search_hotels(self.query)[0]
+        hotel = search_hotels(self.query).offers[0]
         self.assertEqual(hotel.property_token, "test-property-token")
         self.assertEqual(hotel.details.stars, 4)
         self.api.assert_called_once()
 
     def test_missing_details_are_unknown_not_fabricated(self):
         raw = {"name": "Beach Hotel", "total_rate": {"extracted_lowest": "100"}}
-        hotel = parse_hotel_offer(raw, self.query)
+        hotel, _ = parse_hotel_offer(raw, self.query)
         self.assertIsNone(hotel.property_token)
         self.assertTrue(all(value is None for value in hotel.details.model_dump().values()))
         self.assertEqual(hotel.vibe_match_status, "not_verified")
@@ -245,16 +253,16 @@ class HotelProviderTest(unittest.TestCase):
     def test_hotel_stars_are_not_inferred_from_rating_or_class_text(self):
         for raw in (raw_hotel(rating=5), {**raw_hotel(), "hotel_class": "5-star hotel"}):
             with self.subTest(raw=raw):
-                hotel = parse_hotel_offer(raw, self.query)
+                hotel, _ = parse_hotel_offer(raw, self.query)
                 self.assertIsNone(hotel.details.stars)
                 self.assertEqual(hotel.rating, raw["overall_rating"])
 
     def test_property_token_is_optional_opaque_text_not_an_api_url(self):
-        hotel = parse_hotel_offer({**raw_hotel(), "property_token": " opaque_-token== "}, self.query)
+        hotel, _ = parse_hotel_offer({**raw_hotel(), "property_token": " opaque_-token== "}, self.query)
         self.assertEqual(hotel.property_token, "opaque_-token==")
         for value in (None, "", "  ", 123, [], {"token": "test"}):
             with self.subTest(value=value):
-                hotel = parse_hotel_offer({**raw_hotel(), "property_token": value}, self.query)
+                hotel, _ = parse_hotel_offer({**raw_hotel(), "property_token": value}, self.query)
                 self.assertIsNone(hotel.property_token)
 
     def test_malformed_optional_details_do_not_discard_valid_price(self):
@@ -266,17 +274,17 @@ class HotelProviderTest(unittest.TestCase):
             "amenities": "Pool", "excluded_amenities": {}, "essential_info": [None],
             "images": [{"thumbnail": "not a URL"}],
         }
-        hotel = parse_hotel_offer(raw, self.query)
+        hotel, _ = parse_hotel_offer(raw, self.query)
         self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
         self.assertTrue(all(value is None for value in hotel.details.model_dump().values()))
 
     def test_optional_integer_fields_do_not_coerce_booleans_or_strings(self):
         for value in (True, "4", 4.5, {}, None):
             with self.subTest(value=value):
-                hotel = parse_hotel_offer({**raw_hotel(), "extracted_hotel_class": value, "reviews": value}, self.query)
+                hotel, _ = parse_hotel_offer({**raw_hotel(), "extracted_hotel_class": value, "reviews": value}, self.query)
                 self.assertIsNone(hotel.details.stars)
                 self.assertIsNone(hotel.details.reviews)
-        hotel = parse_hotel_offer({**raw_hotel(), "reviews": 0, "extracted_hotel_class": 1}, self.query)
+        hotel, _ = parse_hotel_offer({**raw_hotel(), "reviews": 0, "extracted_hotel_class": 1}, self.query)
         self.assertEqual(hotel.details.reviews, 0)
         self.assertEqual(hotel.details.stars, 1)
 
@@ -287,7 +295,7 @@ class HotelProviderTest(unittest.TestCase):
             {"latitude": 10, "longitude": float("inf")},
         ):
             with self.subTest(value=value):
-                hotel = parse_hotel_offer({**raw_hotel(), "gps_coordinates": value}, self.query)
+                hotel, _ = parse_hotel_offer({**raw_hotel(), "gps_coordinates": value}, self.query)
                 self.assertIsNone(hotel.details.gps_coordinates)
 
     def test_optional_lists_keep_valid_items_without_mutating_response(self):
@@ -296,7 +304,7 @@ class HotelProviderTest(unittest.TestCase):
             "excluded_amenities": [], "essential_info": [False, "Private room"],
         }
         before = deepcopy(raw)
-        hotel = parse_hotel_offer(raw, self.query)
+        hotel, _ = parse_hotel_offer(raw, self.query)
         self.assertEqual(hotel.details.amenities, ["Free Wi-Fi", "Pool"])
         self.assertEqual(hotel.details.excluded_amenities, [])
         self.assertEqual(hotel.details.essential_info, ["Private room"])
@@ -308,7 +316,7 @@ class HotelProviderTest(unittest.TestCase):
         for key in ("amenities", "excluded_amenities", "essential_info", "images"):
             for value, expected in ((None, None), ([], []), ([None, {}], None)):
                 with self.subTest(key=key, value=value):
-                    hotel = parse_hotel_offer({**raw_hotel(), key: value}, self.query)
+                    hotel, _ = parse_hotel_offer({**raw_hotel(), key: value}, self.query)
                     self.assertEqual(getattr(hotel.details, key), expected)
 
     def test_photo_urls_are_validated_without_fetching_them(self):
@@ -321,7 +329,7 @@ class HotelProviderTest(unittest.TestCase):
             {"thumbnail": "https://www.google.com/_/TravelFrontendUi/data/batchexecute"},
             None,
         ]}
-        hotel = parse_hotel_offer(raw, self.query)
+        hotel, _ = parse_hotel_offer(raw, self.query)
         self.assertEqual(len(hotel.details.images), 2)
         self.assertIsNone(hotel.details.images[0].original_image)
         self.assertIsNone(hotel.details.images[1].thumbnail)
@@ -329,7 +337,7 @@ class HotelProviderTest(unittest.TestCase):
         self.api.assert_not_called()
 
     def test_vibe_is_not_verified_from_descriptions_coordinates_or_provider_flags(self):
-        hotel = parse_hotel_offer({
+        hotel, _ = parse_hotel_offer({
             **detailed_raw_hotel(), "name": "Beachfront Hotel", "description": "Near a beach",
             "amenities": ["Beach access"], "vibe_match_status": "verified",
         }, self.query)
@@ -338,7 +346,7 @@ class HotelProviderTest(unittest.TestCase):
             HotelOffer.model_validate({**hotel.model_dump(), "vibe_match_status": "verified"})
 
     def test_unknown_private_provider_fields_are_not_exported(self):
-        hotel = parse_hotel_offer({
+        hotel, _ = parse_hotel_offer({
             **detailed_raw_hotel(), "api_key": "secret-key",
             "serpapi_property_details_link": "https://serpapi.com/search.json?api_key=secret-key",
             "search_metadata": {"json_endpoint": "private-search-url"},
@@ -354,7 +362,7 @@ class HotelProviderTest(unittest.TestCase):
             "search_metadata": {"google_hotels_url": "https://www.google.com/travel/hotels?q=Lisbon"},
             "properties": [detailed_raw_hotel()],
         }
-        hotel = search_hotels(self.query)[0]
+        hotel = search_hotels(self.query).offers[0]
         self.assertEqual(hotel.search_redirect.kind, "hotel_search")
         self.assertEqual(hotel.search_redirect.label, "Open hotel search")
         self.assertEqual(str(hotel.search_redirect.url), "https://www.google.com/travel/hotels?q=Lisbon")
@@ -369,7 +377,7 @@ class HotelProviderTest(unittest.TestCase):
                 "prices": [{"link": "https://booking.example/other-rate", "total_rate": {"extracted_lowest": 1000}}],
             }],
         }
-        hotel = search_hotels(self.query)[0]
+        hotel = search_hotels(self.query).offers[0]
         self.assertIsNone(hotel.redirect)
         self.assertEqual(hotel.search_redirect.kind, "hotel_search")
         self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
@@ -378,16 +386,156 @@ class HotelProviderTest(unittest.TestCase):
         for metadata in (None, [], "invalid", {}, {"google_hotels_url": "https://serpapi.com/search"}):
             with self.subTest(metadata=metadata):
                 self.api.return_value = {"search_metadata": metadata, "properties": [raw_hotel()]}
-                hotel = search_hotels(self.query)[0]
+                hotel = search_hotels(self.query).offers[0]
                 self.assertIsNone(hotel.search_redirect)
                 self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
 
     def test_enrichment_does_not_change_local_budget_filter(self):
         self.api.return_value = {"properties": [detailed_raw_hotel(total="250"), detailed_raw_hotel(total="250.01")]}
-        offers = search_hotels(self.query.model_copy(update={"max_total_price_eur": 250}))
+        offers = search_hotels(self.query.model_copy(update={"max_total_price_eur": 250})).offers
         self.assertEqual(len(offers), 1)
         self.assertEqual(offers[0].total_price_eur, Decimal("250"))
         self.assertEqual(offers[0].details.stars, 4)
+
+    def test_mixed_results_keep_valid_offers_in_order_and_report_each_discard(self):
+        response = {"properties": [
+            raw_hotel(name="First"), {**raw_hotel(), "name": None},
+            raw_hotel(name="Last", total=100), None, {"name": "Unpriced"},
+        ]}
+        original = deepcopy(response)
+        self.api.return_value = response
+        result = search_hotels(self.query)
+        self.assertEqual([offer.name for offer in result.offers], ["First", "Last"])
+        self.assertEqual((result.received_count, result.parsed_count), (5, 2))
+        self.assertEqual([(issue.index, issue.field, issue.code) for issue in result.issues], [
+            (1, "name", "missing_required"), (3, "offer", "invalid_format"), (4, "total_rate", "missing_required"),
+        ])
+        self.assertTrue(all(issue.action == "offer_discarded" for issue in result.issues))
+        self.assertEqual(response, original)
+        self.api.assert_called_once()
+        self.assertEqual(HotelSearchResult.model_validate_json(result.model_dump_json()), result)
+
+    def test_all_invalid_entries_are_distinguishable_from_an_empty_result(self):
+        self.api.return_value = {"properties": [None, {}, {"name": "No price"}]}
+        result = search_hotels(self.query)
+        self.assertEqual(result.offers, [])
+        self.assertEqual(result.parsed_count, 0)
+        self.assertEqual(result.received_count, 3)
+        self.assertEqual(len(result.issues), 3)
+        self.api.return_value = {"properties": []}
+        empty = search_hotels(self.query)
+        self.assertEqual(empty.offers, [])
+        self.assertEqual(empty.received_count, 0)
+        self.assertEqual(empty.issues, [])
+
+    def test_invalid_optional_ratings_are_omitted_without_discarding_the_offer(self):
+        for value in (True, False, -1, 6, "NaN", "Infinity", "bad", [], {}, float("nan")):
+            with self.subTest(value=value):
+                offer, issues = parse_hotel_offer(raw_hotel(rating=value), self.query, index=4)
+                self.assertIsNone(offer.rating)
+                self.assertEqual(offer.total_price_eur, Decimal("249.99"))
+                self.assertEqual(issues, [HotelOfferIssue(
+                    index=4, field="overall_rating", code="invalid_value", action="field_ignored",
+                )])
+
+    def test_valid_rating_boundaries_and_unknown_values_are_preserved(self):
+        for value, expected in ((None, None), (0, 0.0), (5, 5.0), ("4.3", 4.3)):
+            with self.subTest(value=value):
+                offer, issues = parse_hotel_offer(raw_hotel(rating=value), self.query)
+                self.assertEqual(offer.rating, expected)
+                self.assertEqual(issues, [])
+
+    def test_invalid_optional_nightly_rates_produce_field_warnings_only(self):
+        for raw_rate, code in (
+            ([], "invalid_format"), ("PRIVATE", "invalid_format"),
+            ({"extracted_lowest": -1}, "invalid_value"),
+            ({"extracted_lowest": True}, "invalid_value"),
+            ({"extracted_lowest": "NaN"}, "invalid_value"),
+            ({"extracted_lowest": "PRIVATE"}, "invalid_value"),
+        ):
+            with self.subTest(raw_rate=raw_rate):
+                offer, issues = parse_hotel_offer({**raw_hotel(), "rate_per_night": raw_rate}, self.query)
+                self.assertIsNone(offer.nightly_price_eur)
+                self.assertEqual(offer.total_price_eur, Decimal("249.99"))
+                self.assertEqual(issues[0].code, code)
+                self.assertEqual(issues[0].action, "field_ignored")
+                self.assertNotIn("PRIVATE", issues[0].model_dump_json())
+
+    def test_invalid_totals_are_never_replaced_with_a_derived_or_zero_price(self):
+        for value in (True, False, -1, "NaN", "Infinity", "PRIVATE", [], {}, float("nan")):
+            with self.subTest(value=value):
+                self.api.return_value = {"properties": [raw_hotel(total=value)]}
+                result = search_hotels(self.query)
+                self.assertEqual(result.offers, [])
+                self.assertEqual((result.received_count, result.parsed_count), (1, 0))
+                self.assertEqual(result.issues[0].field, "total_rate")
+                self.assertEqual(result.issues[0].code, "invalid_value")
+                self.assertNotIn("PRIVATE", result.model_dump_json())
+
+    def test_valid_zero_total_and_missing_optional_fields_are_not_fabricated(self):
+        offer, issues = parse_hotel_offer({"name": "Free stay", "total_rate": {"extracted_lowest": 0}}, self.query)
+        self.assertEqual(offer.total_price_eur, 0)
+        self.assertIsNone(offer.nightly_price_eur)
+        self.assertIsNone(offer.rating)
+        self.assertEqual(issues, [])
+
+    def test_price_filter_does_not_turn_valid_but_expensive_offers_into_parse_failures(self):
+        self.api.return_value = {"properties": [raw_hotel(total=300), None]}
+        result = search_hotels(self.query.model_copy(update={"max_total_price_eur": 250}))
+        self.assertEqual(result.offers, [])
+        self.assertEqual((result.received_count, result.parsed_count), (2, 1))
+        self.assertEqual(len(result.issues), 1)
+        self.assertEqual(result.issues[0].index, 1)
+
+    def test_optional_field_warnings_are_returned_by_the_search(self):
+        self.api.return_value = {"properties": [{**raw_hotel(rating="bad"), "rate_per_night": []}]}
+        result = search_hotels(self.query)
+        self.assertEqual(len(result.offers), 1)
+        self.assertEqual(result.parsed_count, 1)
+        self.assertEqual({issue.field for issue in result.issues}, {"overall_rating", "rate_per_night"})
+        self.assertTrue(all(issue.action == "field_ignored" for issue in result.issues))
+
+    def test_programming_errors_are_not_swallowed_as_invalid_provider_items(self):
+        for error in (RuntimeError("Bug"), ValueError("Unexpected internal failure")):
+            with self.subTest(error=type(error).__name__), patch("providers.hotels.parse_hotel_offer", side_effect=error):
+                with self.assertRaises(type(error)) as caught:
+                    search_hotels(self.query)
+                self.assertIs(caught.exception, error)
+
+    def test_result_model_rejects_inconsistent_counts_and_unsafe_issue_values(self):
+        for changes in ({"received_count": -1}, {"received_count": 0, "parsed_count": 1}, {"parsed_count": 0}):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                offer, _ = parse_hotel_offer(raw_hotel(), self.query)
+                HotelSearchResult(**{"offers": [offer], "received_count": 1, "parsed_count": 1, **changes})
+        for changes in ({"index": True}, {"field": "PRIVATE"}, {"code": "PRIVATE"}, {"action": "PRIVATE"}):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                HotelOfferIssue(**{"index": 0, "field": "offer", "code": "invalid_format", "action": "offer_discarded", **changes})
+
+    def test_manual_demo_reports_discards_and_does_not_call_all_invalid_results_empty(self):
+        import contextlib
+        import io
+        import try_serpapi
+        from test_flights import fake_city, make_flight
+
+        offer, _ = parse_hotel_offer(raw_hotel(), self.query)
+        for valid in (False, True):
+            with self.subTest(valid=valid):
+                result = HotelSearchResult(
+                    offers=[offer] if valid else [], parsed_count=int(valid), received_count=1 + int(valid),
+                    issues=[HotelOfferIssue(index=int(valid), field="total_rate", code="missing_required", action="offer_discarded")],
+                )
+                with patch("try_serpapi.resolve_city", side_effect=fake_city), patch(
+                    "try_serpapi.search_flights", return_value=[make_flight()]
+                ), patch("try_serpapi.search_hotels", return_value=result) as hotels, contextlib.redirect_stdout(io.StringIO()) as output:
+                    if valid:
+                        try_serpapi.main(["--hotels"])
+                    else:
+                        with self.assertRaises(SerpAPIResponseError) as caught:
+                            try_serpapi.main(["--hotels"])
+                        self.assertEqual(caught.exception.kind, "all_hotel_offers_invalid")
+                hotels.assert_called_once()
+                self.assertIn("Hotel issue:", output.getvalue())
+                self.assertNotIn("Hotel offers found: 0", output.getvalue())
 
 
 class RecordedHotelFixtureTest(unittest.TestCase):
@@ -406,7 +554,7 @@ class RecordedHotelFixtureTest(unittest.TestCase):
                     raw_hotels = fixture["response"]["properties"]
                     self.assertTrue(raw_hotels, "La fixture deve coprire almeno un'offerta reale.")
                     with patch("providers.hotels.search_serpapi", return_value=fixture["response"]) as api:
-                        offers = search_hotels(query)
+                        offers = search_hotels(query).offers
                     api.assert_called_once_with({
                         "engine": "google_hotels",
                         "q": f"Hotels in {query.location_name or query.destination}",

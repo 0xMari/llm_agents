@@ -15,9 +15,9 @@ from decimal import Decimal
 from providers.flights import search_flights
 from providers.flights import FlightLocationError, resolve_city
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
-from providers.hotels import parse_hotel_offer, search_hotels
+from providers.hotels import HotelOfferParseError, parse_hotel_offer, search_hotels
 from test_flights import fake_city, fake_flight_search, make_flight, raw_leg
-from test_hotels import detailed_raw_hotel, fake_hotel_search, raw_hotel
+from test_hotels import detailed_raw_hotel, fake_hotel_search, hotel_search_result, raw_hotel
 from test_proposal_summary import fake_summary_response
 
 from scoring import score_proposal, select_final_proposals
@@ -271,7 +271,7 @@ class WorkflowTest(unittest.TestCase):
             )
         ]
         with patch("planning.search_flights", return_value=flights) as flight_search, patch(
-            "planning.search_hotels", return_value=hotels,
+            "planning.search_hotels", return_value=hotel_search_result(hotels),
         ) as hotel_search:
             result = self.build_proposal(self.flight_request())
 
@@ -331,9 +331,9 @@ class WorkflowTest(unittest.TestCase):
             return [flight]
 
         self.fake_flight_search.side_effect = flights
-        self.fake_hotel_search.side_effect = lambda query, **kwargs: [HotelOffer(
+        self.fake_hotel_search.side_effect = lambda query, **kwargs: hotel_search_result([HotelOffer(
             destination=query.destination, name=f"Stay in {query.destination}", nights=5, total_price_eur=200,
-        )]
+        )])
         for summary_fails in (False, True):
             with self.subTest(summary_fails=summary_fails):
                 self.fake_openrouter_call.side_effect = [json.dumps(advice_by_destination[d.name]) for d in destinations]
@@ -376,7 +376,7 @@ class WorkflowTest(unittest.TestCase):
             (20, flights[1:], [650, 720]),
         ):
             with self.subTest(flexibility=flexibility, expected=expected_totals), patch("planning.search_flights", return_value=candidates), patch(
-                "planning.search_hotels", return_value=[hotel],
+                "planning.search_hotels", return_value=hotel_search_result([hotel]),
             ):
                 request = self.flight_request(budget_eur=600, budget_flexibility_pct=flexibility)
                 result = self.build_proposal(request)
@@ -393,7 +393,7 @@ class WorkflowTest(unittest.TestCase):
         flight = make_flight()
         hotel = HotelOffer(destination="Lisbon", name="Test stay", nights=5, total_price_eur=500)
         with patch("planning.search_flights", return_value=[flight, flight.model_copy(deep=True)]), patch(
-            "planning.search_hotels", return_value=[hotel],
+            "planning.search_hotels", return_value=hotel_search_result([hotel]),
         ):
             result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
@@ -599,7 +599,7 @@ class WorkflowTest(unittest.TestCase):
         )
 
         with patch("providers.hotels.search_serpapi", return_value={"properties": [raw_hotel(total=499), raw_hotel(total=501)]}):
-            hotels = search_hotels(query)
+            hotels = search_hotels(query).offers
 
         self.assertEqual(len(hotels), 1)
         for hotel in hotels:
@@ -615,7 +615,7 @@ class WorkflowTest(unittest.TestCase):
         )
 
         with patch("providers.hotels.search_serpapi", return_value={"properties": []}) as api:
-            hotels = search_hotels(query)
+            hotels = search_hotels(query).offers
 
         self.assertEqual(hotels, [])
         self.assertEqual(api.call_args.args[0]["q"], "Hotels in Madrid")
@@ -831,7 +831,7 @@ class WorkflowTest(unittest.TestCase):
                 )
                 self.assertIsNone(request.budget_eur)
                 with patch("planning.search_flights", return_value=[flight]), patch(
-                    "planning.search_hotels", return_value=[hotel]
+                    "planning.search_hotels", return_value=hotel_search_result([hotel])
                 ):
                     result = self.build_proposal(request)
 
@@ -881,7 +881,7 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(missing_step=missing_step):
                 flights = [] if missing_step == "flights" else [flight]
                 with patch("planning.search_flights", return_value=flights), patch(
-                    "planning.search_hotels", return_value=[]
+                    "planning.search_hotels", return_value=hotel_search_result([])
                 ):
                     result = self.build_proposal(request)
 
@@ -906,7 +906,7 @@ class WorkflowTest(unittest.TestCase):
                 )
                 flight, hotel = fake_flight_and_hotel(total)
                 with patch("planning.search_flights", return_value=[flight]), patch(
-                    "planning.search_hotels", return_value=[hotel]
+                    "planning.search_hotels", return_value=hotel_search_result([hotel])
                 ):
                     result = self.build_proposal(request)
 
@@ -941,7 +941,7 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(total=total):
                 flight, hotel = fake_flight_and_hotel(total)
                 with patch("planning.search_flights", return_value=[flight]), patch(
-                    "planning.search_hotels", return_value=[hotel]
+                    "planning.search_hotels", return_value=hotel_search_result([hotel])
                 ):
                     result = self.build_proposal(request)
 
@@ -1046,7 +1046,7 @@ class WorkflowTest(unittest.TestCase):
             destination_pref=DestinationPreference(mode="fixed", destination="Lisbon"),
             time_pref=TimePreference(mode="flexible_window", min_days=4, max_days=6),
         )
-        with patch("planning.search_hotels", return_value=[]):
+        with patch("planning.search_hotels", return_value=hotel_search_result([])):
             result = self.build_proposal(request)
 
         self.assertIsInstance(result, PlanningError)
@@ -1111,7 +1111,7 @@ class WorkflowTest(unittest.TestCase):
 
                 def available_hotels(query, *, budget=None):
                     if missing_step == "hotels" and query.checkin_date == date(2026, 9, 15):
-                        return []
+                        return hotel_search_result([])
                     return fake_hotel_search(query)
 
                 with patch("planning.search_flights", side_effect=available_flights), patch(
@@ -1674,7 +1674,7 @@ class WorkflowTest(unittest.TestCase):
                 raw_hotel(name="Simple Rooms", total=totals[1]),
             ]}
             with patch("providers.hotels.search_serpapi", return_value=response):
-                return search_hotels(query)
+                return search_hotels(query).offers
 
         first = search(18)
         second = search(22)
@@ -1782,7 +1782,7 @@ class WorkflowTest(unittest.TestCase):
         ]
         _, hotel = fake_flight_and_hotel(500)
         self.fake_hotel_search.side_effect = None
-        self.fake_hotel_search.return_value = [hotel.model_copy(update={"destination": "Florence"})]
+        self.fake_hotel_search.return_value = hotel_search_result([hotel.model_copy(update={"destination": "Florence"})])
         with patch("planning.resolve_destinations", return_value=[destination]), patch(
             "planning.resolve_city", resolve_city
         ), patch("planning.search_flights", search_flights), patch(
@@ -1894,7 +1894,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_empty_hotel_search_is_cached_for_identical_stays(self):
         self.fake_hotel_search.side_effect = None
-        self.fake_hotel_search.return_value = []
+        self.fake_hotel_search.return_value = hotel_search_result([])
         result = self.build_proposal(self.flight_request())
         self.assertEqual(result.code, ReasonCode.NO_HOTELS_FOUND.value)
         self.fake_hotel_search.assert_called_once()
@@ -1931,7 +1931,7 @@ class WorkflowTest(unittest.TestCase):
             return fake_city(text, **kwargs)
         self.fake_resolve_city.side_effect = resolve_homonym
         self.fake_flight_search.side_effect = lambda query, **kwargs: [flight.model_copy(update={"destination": query.destination})]
-        self.fake_hotel_search.side_effect = lambda query, **kwargs: [hotel.model_copy(update={"destination": query.destination})]
+        self.fake_hotel_search.side_effect = lambda query, **kwargs: hotel_search_result([hotel.model_copy(update={"destination": query.destination})])
         with patch("planning.resolve_destinations", return_value=destinations):
             result = self.build_proposal(self.flight_request(destination_pref=DestinationPreference(mode="open")))
         self.assertNotIsInstance(result, PlanningError)
@@ -1947,10 +1947,10 @@ class WorkflowTest(unittest.TestCase):
         self.fake_flight_search.side_effect = None
         self.fake_flight_search.return_value = [make_flight()]
         self.fake_hotel_search.side_effect = None
-        self.fake_hotel_search.return_value = [
+        self.fake_hotel_search.return_value = hotel_search_result([
             hotel.model_copy(update={"name": "Unrated", "rating": None}),
             hotel.model_copy(update={"name": "Rated", "rating": 0.0}),
-        ]
+        ])
         result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual([proposal.hotel.name for proposal in result.proposals], ["Rated"])
@@ -1958,7 +1958,7 @@ class WorkflowTest(unittest.TestCase):
         for proposal in result.proposals:
             self.assertNotIn(ReasonCode.GOOD_HOTEL_RATING, [comment.reason_code for comment in proposal.comments])
 
-        self.fake_hotel_search.return_value = [self.fake_hotel_search.return_value[0]]
+        self.fake_hotel_search.return_value = hotel_search_result([self.fake_hotel_search.return_value.offers[0]])
         result = self.build_proposal(self.flight_request())
         self.assertNotIsInstance(result, PlanningError)
         self.assertEqual(len(result.proposals), 1)
@@ -1993,7 +1993,7 @@ class WorkflowTest(unittest.TestCase):
         self.fake_flight_search.side_effect = None
         self.fake_flight_search.return_value = [first, second]
         _, hotel = fake_flight_and_hotel(500)
-        self.fake_hotel_search.side_effect = [[hotel], SerpAPIError("Timeout", code="TIMEOUT")]
+        self.fake_hotel_search.side_effect = [hotel_search_result([hotel]), SerpAPIError("Timeout", code="TIMEOUT")]
         result = self.build_proposal(self.flight_request())
         self.assertEqual(result.code, ReasonCode.HOTEL_PROVIDER_ERROR.value)
         self.assertIn(EventType.COMBINATION_ACCEPTED, [item.event_type for item in result.trace.events])
@@ -2200,7 +2200,7 @@ class HotelOfferTest(unittest.TestCase):
         self.assertNotEqual(hotel.total_price_eur, hotel.nightly_price_eur * hotel.nights)
 
     def test_parser_preserves_prices_and_derives_nights(self):
-        hotel = parse_hotel_offer(self.raw_hotel, self.query)
+        hotel, _ = parse_hotel_offer(self.raw_hotel, self.query)
         self.assertEqual(hotel.destination, self.query.destination)
         self.assertEqual(hotel.name, "Test Stay")
         self.assertEqual(hotel.nights, 5)
@@ -2219,22 +2219,32 @@ class HotelOfferTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 raw_hotel = {key: value for key, value in self.raw_hotel.items() if key != "total_rate"}
                 raw_hotel.update(fields)
-                with self.assertRaisesRegex(SerpAPIResponseError, "total price"):
+                with self.assertRaises(HotelOfferParseError) as caught:
                     parse_hotel_offer(raw_hotel, self.query)
+                self.assertEqual(caught.exception.field, "total_rate")
 
     def test_parser_rejects_negative_or_nonfinite_prices(self):
-        for field in ("rate_per_night", "total_rate"):
-            for value in (-1, "NaN", "Infinity"):
-                with self.subTest(field=field, value=value):
-                    raw_hotel = {**self.raw_hotel, field: {"extracted_lowest": value}}
-                    with self.assertRaises(SerpAPIResponseError):
-                        parse_hotel_offer(raw_hotel, self.query)
+        for value in (-1, "NaN", "Infinity"):
+            with self.subTest(value=value):
+                raw_hotel = {**self.raw_hotel, "total_rate": {"extracted_lowest": value}}
+                with self.assertRaises(HotelOfferParseError):
+                    parse_hotel_offer(raw_hotel, self.query)
+
+    def test_parser_omits_invalid_optional_nightly_prices(self):
+        for value in (-1, "NaN", "Infinity"):
+            with self.subTest(value=value):
+                raw_hotel = {**self.raw_hotel, "rate_per_night": {"extracted_lowest": value}}
+                hotel, issues = parse_hotel_offer(raw_hotel, self.query)
+                self.assertIsNone(hotel.nightly_price_eur)
+                self.assertEqual(hotel.total_price_eur, Decimal("249.99"))
+                self.assertEqual(issues[0].field, "rate_per_night")
+                self.assertEqual(issues[0].action, "field_ignored")
 
     def test_parser_rejects_invalid_stay_dates(self):
         for checkout_day in (14, 15):
             with self.subTest(checkout_day=checkout_day):
                 query = self.query.model_copy(update={"checkout_date": date(2026, 9, checkout_day)})
-                with self.assertRaises(SerpAPIResponseError):
+                with self.assertRaises(ValueError):
                     parse_hotel_offer(self.raw_hotel, query)
 
 
