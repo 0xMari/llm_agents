@@ -2,5 +2,9 @@ annotated-types==0.7.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 typing-inspection==0.4.2
-typing_extensions==4.15.0
+typing_extensions==4.16.0
 requests==2.34.2
+fastapi==0.162.0
+starlette==1.10.0
+uvicorn==0.54.0
+httpx2==2.16.0
