@@ -79,6 +79,7 @@ def fake_flight_and_hotel(total_price: int | Decimal) -> tuple[FlightOffer, Hote
 
 class WorkflowTest(unittest.TestCase):
     def setUp(self):
+        self.reference = date(2026, 6, 7)
         self.limits = SearchLimits(
             max_destinations=3, max_periods_per_destination=3,
             max_outbound=3, max_serpapi_calls=50, max_llm_calls=5,
@@ -117,7 +118,7 @@ class WorkflowTest(unittest.TestCase):
 
     def build_proposal(self, request):
         # These tests exercise multiple candidates; smoke-test defaults are narrower.
-        return build_proposal(request, limits=self.limits)
+        return build_proposal(request, limits=self.limits, reference_date=self.reference)
 
     def test_all_agents_request_english_output_without_rewriting_the_user_vibe(self):
         request = self.flight_request(
@@ -303,8 +304,6 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(len(summary_payload["proposals"]), 3)
 
     def test_travel_context_stays_with_each_destination_even_if_summary_fails(self):
-        clock = self.enterContext(patch("agents.travel_window.date", wraps=date))
-        clock.today.return_value = date(2026, 6, 7)
         destinations = [
             SuggestedDestination(name="Lisbon", country="Portugal", reason="Food", match_score=90),
             SuggestedDestination(name="Tokyo", country="Japan", reason="Museums", match_score=80),
@@ -669,7 +668,7 @@ class WorkflowTest(unittest.TestCase):
                     "destinations": [dict(candidate, name=name) for name in names],
                 })
 
-                destinations = suggest_destinations(request)
+                destinations = suggest_destinations(request, reference_date=self.reference)
 
                 self.assertEqual([destination.name for destination in destinations], names)
                 for destination in destinations:
@@ -712,7 +711,7 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(case=label):
                 self.fake_destination_call.return_value = response
                 with self.assertRaises(ValidationError):
-                    suggest_destinations(request)
+                    suggest_destinations(request, reference_date=self.reference)
 
 
     def assert_destination_failure_stops_workflow(self, expected_reason):
@@ -1275,7 +1274,7 @@ class WorkflowTest(unittest.TestCase):
             match_score=100,
         )
 
-        advice = evaluate_travel_window(request, destination)
+        advice = evaluate_travel_window(request, destination, reference_date=self.reference)
 
         self.assertEqual(advice.selected_periods[0].start, start)
         self.assertEqual(advice.selected_periods[0].end, end)
@@ -1362,7 +1361,7 @@ class WorkflowTest(unittest.TestCase):
             match_score=100,
         )
 
-        advice = evaluate_travel_window(request, destination)
+        advice = evaluate_travel_window(request, destination, reference_date=self.reference)
 
         self.assertEqual(advice.selected_periods[0].start, date(2026, 9, 15))
         self.assertEqual(advice.selected_periods[0].end, date(2026, 9, 20))
@@ -1390,7 +1389,7 @@ class WorkflowTest(unittest.TestCase):
         )
 
         with self.assertRaises(ValidationError):
-            evaluate_travel_window(request, destination)
+            evaluate_travel_window(request, destination, reference_date=self.reference)
 
 
     def test_travel_window_rejects_llm_dates_that_violate_exact_dates(self):
@@ -1423,7 +1422,7 @@ class WorkflowTest(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            evaluate_travel_window(request, destination)
+            evaluate_travel_window(request, destination, reference_date=self.reference)
 
 
     def assert_build_proposal_llm_failure(self, expected_reason):
@@ -1492,8 +1491,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_filtered_alternatives_reach_trace_and_summary_without_losing_offers(self):
         reference = date(2026, 10, 23)
-        clock = self.enterContext(patch("agents.travel_window.date", wraps=date))
-        clock.today.return_value = reference
+        self.reference = reference
         self.fake_flight_search.side_effect = None
         self.fake_flight_search.return_value = [make_flight(
             start=date(2026, 12, 5), end=date(2026, 12, 10),
@@ -1713,12 +1711,12 @@ class WorkflowTest(unittest.TestCase):
         )
         destination = SuggestedDestination(name="Lisbon", reason="Test", match_score=100)
         self.fake_openrouter_call.return_value = fake_travel_window_response(end="2026-09-20")
-        advice = evaluate_travel_window(request, destination)
+        advice = evaluate_travel_window(request, destination, reference_date=self.reference)
         self.assertEqual(advice.selected_periods[0].end, date(2026, 9, 20))
 
         self.fake_openrouter_call.return_value = fake_travel_window_response(end="2026-09-21")
         with self.assertRaisesRegex(ValueError, "maximum trip duration"):
-            evaluate_travel_window(request, destination)
+            evaluate_travel_window(request, destination, reference_date=self.reference)
 
 
     def flight_request(self, **fields):
@@ -2170,7 +2168,7 @@ class TravelWindowAlternativesTest(unittest.TestCase):
         prompt = build_system_prompt()
         self.assertIn("Alternative periods must start on or after time_context.reference_date", prompt)
         self.assertIn("Alternatives may fall in a later year", prompt)
-        self.assertIn("resolved_year constrains selected_periods only", prompt)
+        self.assertIn("resolved_year constrains selected departures only, not alternative periods", prompt)
         self.assertIn("selected_periods must use those dates", prompt)
 
 

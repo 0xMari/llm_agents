@@ -70,11 +70,15 @@ Rules:
 - If the user provides exact dates, selected_periods must use those dates.
 - If exact dates are not ideal, add warnings and alternatives.
 - For a month, season, or flexible window, suggest periods consistent with the request.
-- If time_preference.mode is "month", selected_periods must use time_context.resolved_year.
+- Every selected departure must be on or after time_context.reference_date; same-day departures are allowed.
+- If time_preference.mode is "month", departures must use the requested month and time_context.resolved_year.
+- Month and season constrain departure only; returns may fall in a later month, season, or year, respecting trip duration.
+- Seasons use fixed Northern Hemisphere calendar months, regardless of the destination: spring March-May, summer June-August, autumn September-November, winter December-February.
+- For season mode, selected departures must be on or after time_context.departure_window.start and strictly before time_context.departure_window.end_exclusive.
 - Use time_context.reference_date to determine whether an alternative period is in the past.
 - Alternative periods must start on or after time_context.reference_date.
 - Alternatives may fall in a later year, including the next calendar year.
-- For month mode, time_context.resolved_year constrains selected_periods only.
+- For month mode, time_context.resolved_year constrains selected departures only, not alternative periods.
 - Respect min_days and max_days when provided.
 - min_days and max_days are inclusive days: count both departure and return days.
 - Calculate duration as (end - start).days + 1.
@@ -90,6 +94,20 @@ def resolve_month_year(month: int, reference_date: date) -> int:
     return reference_date.year + 1
 
 
+def resolve_season_window(season: str, reference_date: date) -> tuple[date, date]:
+    start_months = {"spring": 3, "summer": 6, "autumn": 9, "winter": 12}
+    if season not in start_months:
+        raise ValueError("Unsupported season.")
+    month = start_months[season]
+    for year in range(max(1, reference_date.year - 1), reference_date.year + 2):
+        start = date(year, month, 1)
+        end = date(year + 1, 3, 1) if season == "winter" else date(year, month + 3, 1)
+        # End-exclusive boundaries also handle leap years without counting days.
+        if end > reference_date:
+            return max(start, reference_date), end
+    raise ValueError("Unable to resolve the requested season.")
+
+
 def build_time_context(request: TripRequest, reference_date: date) -> dict:
     time_context = {
         "reference_date": reference_date.isoformat(),
@@ -100,6 +118,13 @@ def build_time_context(request: TripRequest, reference_date: date) -> dict:
             month=request.time_pref.month,
             reference_date=reference_date,
         )
+
+    if request.time_pref.mode == "season" and request.time_pref.season is not None:
+        first, end_exclusive = resolve_season_window(request.time_pref.season, reference_date)
+        time_context["departure_window"] = {
+            "start": first.isoformat(),
+            "end_exclusive": end_exclusive.isoformat(),
+        }
 
     return time_context
 
@@ -124,6 +149,19 @@ def build_user_prompt(
 
 class TravelWindowConstraintError(ValueError):
     pass
+
+
+class InvalidTravelDates(ValueError):
+    pass
+
+
+def validate_request_dates(request: TripRequest, reference_date: date) -> None:
+    if (
+        request.time_pref.mode == "exact_dates"
+        and request.time_pref.start_date is not None
+        and request.time_pref.start_date < reference_date
+    ):
+        raise InvalidTravelDates("The departure date cannot be in the past.")
 
 
 def remove_past_alternatives(
@@ -168,7 +206,7 @@ def validate_travel_window_constraints(
         )
 
         for period in advice.selected_periods:
-            if period.start.year != expected_year or period.end.year != expected_year:
+            if period.start.year != expected_year:
                 raise TravelWindowConstraintError(
                     "The LLM used a year different from the one resolved by the system."
                 )
@@ -180,8 +218,19 @@ def validate_travel_window_constraints(
 
     min_days = request.time_pref.min_days
     max_days = request.time_pref.max_days
+    season_window = None
+    if request.time_pref.mode == "season" and request.time_pref.season is not None:
+        season_window = resolve_season_window(request.time_pref.season, reference_date)
 
     for period in advice.selected_periods:
+        if period.start < reference_date:
+            raise TravelWindowConstraintError("The LLM proposed a departure date in the past.")
+
+        if season_window is not None:
+            first, end_exclusive = season_window
+            if not first <= period.start < end_exclusive:
+                raise TravelWindowConstraintError("The LLM violated the requested season.")
+
         duration_days = (period.end - period.start).days + 1
 
         if min_days is not None and duration_days < min_days:
@@ -203,6 +252,7 @@ def evaluate_travel_window(
     budget: RunBudget | None = None,
 ) -> TravelWindowAdvice:
     resolved_reference_date = reference_date or date.today()
+    validate_request_dates(request, resolved_reference_date)
 
     messages = [
         {

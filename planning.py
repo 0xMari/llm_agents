@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 from typing import Literal
 
@@ -14,7 +15,7 @@ from providers.location_verification import CityCountryVerifier
 from providers.serpapi_client import SerpAPIError, SerpAPIResponseError
 
 from scoring import select_final_proposals
-from agents.travel_window import evaluate_travel_window
+from agents.travel_window import InvalidTravelDates, evaluate_travel_window, validate_request_dates
 
 from models import (
     DecisionEvent,
@@ -39,7 +40,9 @@ from llm.openrouter import OpenRouterError
 from agents.travel_window import TravelWindowConstraintError
 
 
-def resolve_destinations(request: TripRequest, *, budget: RunBudget) -> list[SuggestedDestination]:
+def resolve_destinations(
+    request: TripRequest, *, budget: RunBudget, reference_date: date,
+) -> list[SuggestedDestination]:
     if request.destination_pref.mode == "fixed":
         return [
             SuggestedDestination(
@@ -49,7 +52,7 @@ def resolve_destinations(request: TripRequest, *, budget: RunBudget) -> list[Sug
             )
         ]
 
-    return suggest_destinations(request, budget=budget)
+    return suggest_destinations(request, budget=budget, reference_date=reference_date)
 
 
 def calculate_budget_ceiling(request: TripRequest) -> Decimal | None:
@@ -171,11 +174,16 @@ def record_hotel_issues(
 def build_proposal(
     request: TripRequest, *, limits: SearchLimits,
     country_verifier: CityCountryVerifier | None = None,
+    reference_date: date | None = None,
 ) -> TripSearchResult | PlanningError:
+    resolved_reference_date = reference_date or date.today()
     budget = RunBudget(limits)
     events = []
     try:
-        result = _build_proposal(request, budget=budget, events=events, country_verifier=country_verifier)
+        result = _build_proposal(
+            request, budget=budget, events=events, country_verifier=country_verifier,
+            reference_date=resolved_reference_date,
+        )
     except SearchLimitExceeded as error:
         message = "Search stopped: the configured call limit was reached."
         events.append(DecisionEvent(
@@ -220,6 +228,7 @@ def record_scope_reduction(
 
 def _build_proposal(
     request: TripRequest, *, budget: RunBudget, events: list[DecisionEvent],
+    reference_date: date,
     country_verifier: CityCountryVerifier | None = None,
 ) -> TripSearchResult | PlanningError:
     limits = budget.limits
@@ -244,7 +253,24 @@ def _build_proposal(
     )
 
     try:
-        destinations = resolve_destinations(request, budget=budget)
+        validate_request_dates(request, reference_date)
+    except InvalidTravelDates as error:
+        message = str(error)
+        events.append(DecisionEvent(
+            event_type=EventType.SEARCH_FAILED,
+            reason_code=ReasonCode.INVALID_TRAVEL_DATES,
+            details={
+                "stage": "input_validation", "reference_date": reference_date.isoformat(),
+                "start_date": request.time_pref.start_date.isoformat(),
+            },
+            comment=message,
+        ))
+        return PlanningError(
+            code=ReasonCode.INVALID_TRAVEL_DATES.value, message=message, trace=DecisionTrace(events=events),
+        )
+
+    try:
+        destinations = resolve_destinations(request, budget=budget, reference_date=reference_date)
     except (OpenRouterError, ValidationError) as exc:
         details: dict[str, str | int | None] = {"agent": "destination"}
         if isinstance(exc, OpenRouterError):
@@ -293,7 +319,9 @@ def _build_proposal(
     
     for destination in destinations:
         try:
-            window_advice = evaluate_travel_window(request, destination, budget=budget)
+            window_advice = evaluate_travel_window(
+                request, destination, budget=budget, reference_date=reference_date,
+            )
         except (OpenRouterError, ValidationError, TravelWindowConstraintError) as exc:
             details = {"destination": destination.name}
             if isinstance(exc, OpenRouterError):

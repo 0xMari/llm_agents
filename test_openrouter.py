@@ -395,6 +395,8 @@ class OpenRouterDiagnosticsTest(unittest.TestCase):
 
 class PlannerLLMDiagnosticsTest(unittest.TestCase):
     def setUp(self):
+        clock = self.enterContext(patch("planning.date", wraps=date))
+        clock.today.return_value = date(2026, 10, 25)
         self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("Live HTTP disabled")))
         self.enterContext(patch.dict("os.environ", {
             "OPENROUTER_API_KEY": SECRET_KEY, "OPENROUTER_MODEL": "test-model",
